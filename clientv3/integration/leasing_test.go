@@ -315,3 +315,52 @@ func TestLeasingRevGet(t *testing.T) {
 		t.Fatalf(`expeted "k"->"abc" at rev=%d, got response %+v`, putResp.Header.Revision, getResp)
 	}
 }
+
+// TestLeasingConcurrentPut ensures that a get after concurrent puts returns
+// the recently put data.
+func TestLeasingConcurrentPut(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// concurrently put through leasing client
+	numPuts := 16
+	putc := make(chan *clientv3.PutResponse, numPuts)
+	for i := 0; i < numPuts; i++ {
+		go func() {
+			resp, perr := lkv.Put(context.TODO(), "k", "abc")
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			putc <- resp
+		}()
+	}
+	// record maximum revision from puts
+	maxRev := int64(0)
+	for i := 0; i < numPuts; i++ {
+		if resp := <-putc; resp.Header.Revision > maxRev {
+			maxRev = resp.Header.Revision
+		}
+	}
+
+	// confirm Get gives most recently put revisions
+	getResp, gerr := lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(err)
+	}
+	if mr := getResp.Kvs[0].ModRevision; mr != maxRev {
+		t.Errorf("expected ModRevision %d, got %d", maxRev, mr)
+	}
+	if ver := getResp.Kvs[0].Version; ver != int64(numPuts) {
+		t.Errorf("expected Version %d, got %d", numPuts, ver)
+	}
+}
