@@ -77,44 +77,68 @@ func (lkv *leasingKV) InitKV(key, val string) *mvccpb.KeyValue {
 	return myKV
 }
 
+func (lkv *leasingKV) modifyKVS(key, val string, tranResp *v3.TxnResponse) {
+	lkv.mu.Lock()
+	//initialize KV struct and append to response if key doesn't exist
+	if len(lkv.leaseInfomap[lkv.pfx+key].response.Kvs) == 0 {
+		myKV := lkv.InitKV(key, val)
+		lkv.leaseInfomap[lkv.pfx+key].response.Kvs = append(lkv.leaseInfomap[lkv.pfx+key].response.Kvs, myKV)
+	}
+
+	// if key present, just update value and revision (//race condition tackle)
+	if len(lkv.leaseInfomap[lkv.pfx+key].response.Kvs) > 0 {
+		lkv.leaseInfomap[lkv.pfx+key].response.Kvs[0].Value = []byte(val)
+		lkv.leaseInfomap[lkv.pfx+key].response.Kvs[0].ModRevision = tranResp.Header.Revision
+	}
+	lkv.mu.Unlock()
+}
+
+func (lkv *leasingKV) updateKey(ctx context.Context, key, val string) {
+
+	//if leasing key revision matches with client's rev in map
+	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leaseInfomap[lkv.pfx+key].revision))
+	txnUpd = txnUpd.Then(v3.OpPut(key, val))
+	respUpd, errUpd := txnUpd.Commit()
+
+	if errUpd != nil {
+		panic("Error in transaction")
+	}
+
+	if respUpd.Succeeded {
+		lkv.modifyKVS(key, val, respUpd)
+	}
+
+}
+
+func (lkv *leasingKV) watchforLKDel(ctx context.Context, key, val string, resp *v3.TxnResponse) {
+
+	cctx, cancel := context.WithCancel(ctx)
+	wch := lkv.cl.Watch(cctx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
+	for resp := range wch {
+		for _, ev := range resp.Events {
+			if ev.Type == v3.EventTypeDelete {
+				cancel()
+				break
+			}
+		}
+	}
+}
+
 func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
 
 	for ctx.Err() == nil {
 
-		//if already exist in map, then update key
+		//if leasing key already exist in map, then update key
 		if _, ok := lkv.leaseInfomap[lkv.pfx+key]; ok {
+			lkv.updateKey(ctx, key, val)
+			break
+		}
 
-			txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leaseInfomap[lkv.pfx+key].revision))
-			txnUpd = txnUpd.Then(v3.OpPut(key, val))
-			respUpd, errUpd := txnUpd.Commit()
+		//lk doesn't exist
+		if _, ok := lkv.leaseInfomap[lkv.pfx+key]; !ok {
 
-			if errUpd != nil {
-				panic("Error in transaction")
-			}
-
-			if respUpd.Succeeded {
-				lkv.mu.Lock()
-				//if key doesn't exist
-				if len(lkv.leaseInfomap[lkv.pfx+key].response.Kvs) == 0 {
-					myKV := lkv.InitKV(key, val)
-					lkv.leaseInfomap[lkv.pfx+key].response.Kvs = append(lkv.leaseInfomap[lkv.pfx+key].response.Kvs, myKV)
-				}
-
-				// if key present, just update value ( what else to update, revisions?)
-				if len(lkv.leaseInfomap[lkv.pfx+key].response.Kvs) > 0 {
-					lkv.leaseInfomap[lkv.pfx+key].response.Kvs[0].Value = []byte(val)
-
-				}
-				lkv.mu.Unlock()
-				break
-
-			}
-
-		} else { // OTHER client
-			//new client - no leasing key
 			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
-			txn = txn.Then(v3.OpPut(key, val)) //should this be happening? check if other clients have same leasing key?
-			//has leasing key, wants to put new value - sends revoke to clients holding leasing key
+			txn = txn.Then(v3.OpPut(key, val)) //no leasing key assosciated with key, so put normally
 			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
 			resp, err := txn.Commit()
 
@@ -123,32 +147,50 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 			}
 
 			if resp.Succeeded {
-				lkv.mu.Lock()
-				lkv.InitKV(key, val)
-				lkv.mu.Unlock()
-
 				resput := resp.Responses[0].GetResponsePut()
 				response := (*v3.PutResponse)(resput)
 				return response, nil
 			}
-
-			cctx, cancel := context.WithCancel(ctx)
-			wch := lkv.cl.Watch(cctx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
-			fmt.Println("Entering loop")
-			for resp := range wch {
-				fmt.Printf("%+v\n", resp)
-				for _, ev := range resp.Events {
-					if ev.Type == v3.EventTypeDelete {
-						cancel()
-						// New client should put its updated value, after having other client revoke lease? should not be breaking.
-						break
-					}
-				}
-			}
+			lkv.watchforLKDel(ctx, key, val, resp)
 		}
 
 	}
 	return nil, ctx.Err()
+}
+
+func (lkv *leasingKV) goRoutine(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
+
+	nctx, cancel := context.WithCancel(lkv.ctx)
+	defer cancel()
+
+	for nctx.Err() == nil {
+		wch := lkv.cl.Watch(nctx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
+		fmt.Println("Entering goroutine")
+
+		for resp := range wch {
+			for _, ev := range resp.Events {
+
+				if string(ev.Kv.Value) == "REVOKE" {
+
+					txn := lkv.cl.Txn(nctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev))
+					txn = txn.Then(v3.OpDelete(lkv.pfx + key))
+					delResp, err := txn.Commit()
+
+					if delResp.Succeeded {
+						lkv.mu.Lock()
+						delete(lkv.leaseInfomap, lkv.pfx+key) //delete from map as well
+						defer lkv.mu.Unlock()
+						return
+					}
+
+					if err != nil || !delResp.Succeeded { //retry
+						continue
+					}
+
+				}
+			}
+		}
+	}
 }
 
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
@@ -157,15 +199,15 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 		return nil, rpctypes.ErrEmptyKey
 	}
 
-	//return cached value
+	//return cached value if lk exists
 	if li, ok := lkv.leaseInfomap[lkv.pfx+key]; ok {
 		return li.response, nil
 	}
 
+	//assigns lk
 	txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
-	//assigns leasing key
 	txn = txn.Then(v3.OpGet(key), v3.OpPut(lkv.pfx+key, "", v3.WithLease(lkv.session.Lease())))
-	//should we be doing this? ( already have cached value)
+	//returns val when no leasing key is assosciated
 	txn = txn.Else(v3.OpGet(key))
 	resp, err := txn.Commit()
 
@@ -175,47 +217,15 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 
 	if resp.Succeeded {
 		lkv.mu.Lock()
-		lkv.leaseInfomap[lkv.pfx+key] = &leaseInfo{response: (*v3.GetResponse)(resp.Responses[0].GetResponseRange()), revision: resp.Header.Revision}
+		//update response map with latest val,rev of key
+		lkv.leaseInfomap[lkv.pfx+key] = &leaseInfo{response: (*v3.GetResponse)(resp.Responses[0].GetResponseRange()),
+			revision: resp.Header.Revision}
 		defer lkv.mu.Unlock()
-		rev := resp.Header.Revision
 
+		rev := resp.Header.Revision
 		//go routine - waiting for revoke message
 		go func() {
-			nctx, cancel := context.WithCancel(lkv.ctx)
-			defer cancel()
-			wch := lkv.cl.Watch(nctx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
-			fmt.Println("Entering goroutine")
-
-			for resp := range wch {
-				fmt.Printf("%+v\n", resp)
-				for _, ev := range resp.Events {
-					fmt.Printf("%+v\n", ev)
-					if string(ev.Kv.Value) == "REVOKE" { //if val is entered as revoke
-						txn := lkv.cl.Txn(nctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev))
-						txn = txn.Then(v3.OpDelete(lkv.pfx + key))
-						delResp, err := txn.Commit()
-
-						if err != nil {
-							//panic("Error")
-
-						}
-
-						if delResp.Succeeded {
-							fmt.Println("Delete success")
-							lkv.mu.Lock()
-							delete(lkv.leaseInfomap, lkv.pfx+key) //delete from map as well
-							defer lkv.mu.Unlock()
-							return
-						}
-
-						//if delResp.!Succeeded {
-
-						//}
-
-					}
-				}
-
-			}
+			lkv.goRoutine(ctx, key, resp, rev)
 		}()
 	}
 
