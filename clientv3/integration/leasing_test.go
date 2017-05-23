@@ -305,8 +305,8 @@ func TestLeasingConcurrentPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if _, err := clus.Client(0).Get(context.TODO(), "k"); err != nil {
+	// force key into leasing key cache
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -693,5 +693,55 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 	}
 	if len(gresp.Kvs) != 1 || string(gresp.Kvs[0].Value) != "456" {
 		t.Errorf(`expected value "def", got %+v`, gresp)
+	}
+}
+
+func TestLeasingOwnerPutError(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	clus.Members[0].Stop(t)
+	if resp, err := lkv.Put(context.TODO(), "k", "v"); err == nil {
+		t.Fatalf("expected error, got response %+v", resp)
+	}
+}
+
+func TestLeasingOwnerDeleteError(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	clus.Members[0].Stop(t)
+	if resp, err := lkv.Delete(context.TODO(), "k"); err == nil {
+		t.Fatalf("expected error, got response %+v", resp)
+	}
+}
+
+func TestLeasingNonOwnerPutError(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clus.Members[0].Stop(t)
+	if resp, err := lkv.Put(context.TODO(), "k", "v"); err == nil {
+		t.Fatalf("expected error, got response %+v", resp)
 	}
 }
