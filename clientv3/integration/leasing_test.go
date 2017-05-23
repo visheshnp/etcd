@@ -513,3 +513,185 @@ func TestLeasingOwnerPutResponse(t *testing.T) {
 		t.Errorf("expected version 2, got version %d", gresp.Kvs[0].Version)
 	}
 }
+
+func TestLeasingTxnOwnerGet2(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "123"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// served through cache
+	clus.Members[0].Stop(t)
+
+	tresp, terr := lkv.Txn(context.TODO()).Then(clientv3.OpGet("k"), clientv3.OpGet("k2")).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if len(tresp.Responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(tresp.Responses))
+	}
+	if rr := tresp.Responses[0].GetResponseRange(); string(rr.Kvs[0].Value) != "abc" {
+		t.Errorf(`expected value "abc", got %q`, string(rr.Kvs[0].Value))
+	}
+	if rr := tresp.Responses[0].GetResponseRange(); string(rr.Kvs[0].Value) != "def" {
+		t.Errorf(`expected value "abc", got %q`, string(rr.Kvs[0].Value))
+	}
+}
+
+func TestLeasingTxnOwnerIf(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// served through cache
+	clus.Members[0].Stop(t)
+
+	tests := []struct {
+		cmps       []clientv3.Cmp
+		wSucceeded bool
+		wResponses int
+	}{
+		// success
+		{
+			cmps:       []clientv3.Cmp{clientv3.Compare(clientv3.Value("k"), "=", "abc")},
+			wSucceeded: true,
+			wResponses: 1,
+		},
+		{
+			cmps:       []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision("k"), "=", 2)},
+			wSucceeded: true,
+			wResponses: 1,
+		},
+		{
+			cmps:       []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision("k"), "=", 2)},
+			wSucceeded: true,
+			wResponses: 1,
+		},
+		{
+			cmps:       []clientv3.Cmp{clientv3.Compare(clientv3.Version("k"), "=", 1)},
+			wSucceeded: true,
+			wResponses: 1,
+		},
+		// failure
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.Value("k"), ">", "abc")},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision("k"), ">", 2)},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision("k"), "=", 2)},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.Version("k"), ">", 1)},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.Value("k"), "<", "abc")},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision("k"), "<", 2)},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision("k"), "<", 2)},
+		},
+		{
+			cmps: []clientv3.Cmp{clientv3.Compare(clientv3.Version("k"), "<", 1)},
+		},
+		{
+			cmps: []clientv3.Cmp{
+				clientv3.Compare(clientv3.Version("k"), "=", 1),
+				clientv3.Compare(clientv3.Version("k"), "<", 1),
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		tresp, terr := lkv.Txn(context.TODO()).If(tt.cmps[i]).Then(clientv3.OpGet("k")).Commit()
+		if terr != nil {
+			t.Fatal(terr)
+		}
+		if tresp.Succeeded != tt.wSucceeded {
+			t.Errorf("#%d: expected succeded %v, got %v", tt.wSucceeded, tresp.Succeeded)
+		}
+		if len(tresp.Responses) != tt.wResponses {
+			t.Errorf("#%d: expected %d responses, got %d", tt.wResponses, len(tresp.Responses))
+		}
+	}
+}
+
+func TestLeasingTxnNonOwnerPut(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lkv2, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "123"); err != nil {
+		t.Fatal(err)
+	}
+	// cache in lkv
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
+		t.Fatal(err)
+	}
+	// invalidate via lkv2 txn
+	tresp, terr := lkv2.Txn(context.TODO()).Then(clientv3.OpPut("k", "def"), clientv3.OpPut("k2", "456")).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if !tresp.Succeeded || len(tresp.Responses) != 2 {
+		t.Fatalf("expected txn success, got %+v", tresp)
+	}
+	// check cache was invalidated
+	gresp, gerr := lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(err)
+	}
+	if len(gresp.Kvs) != 1 || string(gresp.Kvs[0].Value) != "def" {
+		t.Errorf(`expected value "def", got %+v`, gresp)
+	}
+	gresp, gerr = lkv.Get(context.TODO(), "k2")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if len(gresp.Kvs) != 1 || string(gresp.Kvs[0].Value) != "456" {
+		t.Errorf(`expected value "def", got %+v`, gresp)
+	}
+}
