@@ -80,6 +80,9 @@ func (op *Op) WithKeyBytes(key []byte) { op.key = key }
 // RangeBytes returns the byte slice holding with the Op's range end, if any.
 func (op Op) RangeBytes() []byte { return op.end }
 
+// Rev returns the requested revision, if any.
+func (op Op) Rev() int64 { return op.rev }
+
 // WithRangeBytes sets the byte slice for the Op's range end.
 func (op *Op) WithRangeBytes(end []byte) { op.end = end }
 
