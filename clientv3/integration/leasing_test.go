@@ -475,3 +475,41 @@ func TestLeasingOverwriteResponse(t *testing.T) {
 		t.Errorf(`expected value "abc", got %q`, string(resp.Kvs[0].Key))
 	}
 }
+
+func TestLeasingOwnerPutResponse(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	gresp, gerr := lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	presp, err := lkv.Put(context.TODO(), "k", "def")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presp == nil {
+		t.Fatal("expected put response, got nil")
+	}
+
+	clus.Members[0].Stop(t)
+
+	gresp, gerr = lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if gresp.Kvs[0].ModRevision != presp.Header.Revision {
+		t.Errorf("expected mod revision %d, got %d", presp.Header.Revision, gresp.Kvs[0].ModRevision)
+	}
+	if gresp.Kvs[0].Version != 2 {
+		t.Errorf("expected version 2, got version %d", gresp.Kvs[0].Version)
+	}
+}
