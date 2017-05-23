@@ -16,6 +16,7 @@ package leasing
 
 import (
 	"fmt"
+	"reflect"
 
 	"golang.org/x/net/context"
 
@@ -24,6 +25,7 @@ import (
 	v3 "github.com/coreos/etcd/clientv3"
 	concurrency "github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
+	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
@@ -73,29 +75,40 @@ func (lkv *leasingKV) Txn(ctx context.Context) v3.Txn {
 	panic("Stub")
 }
 
-func (lc *leaseCache) update(key, val string, rev int64) {
+//update cache's getresponse
+func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader) {
 	lc.mu.Lock()
 	//initialize KV struct and append to response if key doesn't exist
 	if len(lc.entries[key].response.Kvs) == 0 {
 		myKV := &mvccpb.KeyValue{
-			Value: []byte(val),
-			Key:   []byte(key),
+			Value:   []byte(val),
+			Key:     []byte(key),
+			Version: 0,
 		}
 		lc.entries[key].response.Kvs = append(lc.entries[key].response.Kvs, myKV)
+		fmt.Println(myKV.Value)
+		lc.entries[key].response.More = false
+		lc.entries[key].response.Count = 1
+		lc.entries[key].response.Kvs[0].CreateRevision = respHeader.Revision
 	}
 
 	// if key present, just update value and revision (//race condition tackle)
 	if len(lc.entries[key].response.Kvs) > 0 {
+		lc.entries[key].response.Header = respHeader
 		lc.entries[key].response.Kvs[0].Value = []byte(val)
-		lc.entries[key].response.Kvs[0].ModRevision = rev
+		lc.entries[key].response.Kvs[0].ModRevision = respHeader.Revision
+
+		//lc.entries[key].response.Kvs[0].Version = 0 - tackle later on delete
+		lc.entries[key].response.Kvs[0].Version++
+
 	}
 	lc.mu.Unlock()
 }
 
-func (lkv *leasingKV) updateKey(ctx context.Context, key, val string) {
+func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3.OpOption) *v3.PutResponse {
 	//if leasing key revision matches with client's rev in map
 	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
-	txnUpd = txnUpd.Then(v3.OpPut(key, val))
+	txnUpd = txnUpd.Then(v3.OpPut(key, val, opts...))
 	respUpd, errUpd := txnUpd.Commit()
 
 	if errUpd != nil {
@@ -103,9 +116,11 @@ func (lkv *leasingKV) updateKey(ctx context.Context, key, val string) {
 	}
 
 	if respUpd.Succeeded {
-		lkv.leases.update(key, val, respUpd.Header.Revision)
+		lkv.leases.update(key, val, respUpd.Header)
+		putresp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
+		return putresp
 	}
-
+	return nil
 }
 
 func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) {
@@ -126,14 +141,14 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 
 		//if leasing key already exist in map, then update key
 		if _, ok := lkv.leases.entries[key]; ok {
-			lkv.updateKey(ctx, key, val)
-			break
+			putresp := lkv.updateKey(ctx, key, val, opts...)
+			return putresp, ctx.Err()
 		}
 
 		//lk doesn't exist
 		if _, ok := lkv.leases.entries[key]; !ok {
 			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
-			txn = txn.Then(v3.OpPut(key, val)) //no leasing key assosciated with key, so put normally
+			txn = txn.Then(v3.OpPut(key, val, opts...)) //no leasing key assosciated with key, so put normally
 			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
 			resp, err := txn.Commit()
 
@@ -153,7 +168,7 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 	return nil, ctx.Err()
 }
 
-func (lkv *leasingKV) revokeRoutine(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
+func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
 	nctx, cancel := context.WithCancel(lkv.ctx)
 	defer cancel()
 
@@ -186,14 +201,46 @@ func (lkv *leasingKV) revokeRoutine(ctx context.Context, key string, resp *v3.Tx
 	}
 }
 
+func (lc *leaseCache) CloneValue(source interface{}, destin interface{}) {
+	x := reflect.ValueOf(source)
+	if x.Kind() == reflect.Ptr {
+		starX := x.Elem()
+		y := reflect.New(starX.Type())
+		starY := y.Elem()
+		starY.Set(starX)
+		reflect.ValueOf(destin).Elem().Set(y.Elem())
+	} else {
+		destin = x.Interface()
+	}
+}
+
+func (lc *leaseCache) getCachedCopy(key string) *v3.GetResponse {
+	resp := lc.entries[key].response
+	var copyResp *v3.GetResponse = &v3.GetResponse{}
+	lc.CloneValue(resp, copyResp)
+	return copyResp
+}
+
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
 	if len(key) == 0 {
 		return nil, rpctypes.ErrEmptyKey
 	}
 
+	var gresp *v3.GetResponse
 	//return cached value if lk exists
-	if li, ok := lkv.leases.entries[key]; ok {
-		return li.response, nil
+	if _, ok := lkv.leases.entries[key]; ok {
+		gresp = lkv.leases.getCachedCopy(key)
+		return gresp, nil
+	}
+
+	//if range of keys exist
+	ops := v3.OpGet(key, opts...)
+	if len(opts) > 0 {
+		size := ops.RangeBytes()
+		if len(size) > 0 {
+			return lkv.cl.Get(ctx, key, opts...)
+
+		}
 	}
 
 	//assigns lk
@@ -208,19 +255,30 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 	}
 
 	if resp.Succeeded {
-		lkv.leases.mu.Lock()
+		//if historical version is queried, pass through to client and don't update map
+		//	fmt.Printf("opts %+v \n", ops)
+		if len(opts) > 0 {
+			revnum := ops.RevisionNum()
+			//check for older revisions
+			if revnum < resp.Header.Revision {
+				return lkv.cl.Get(ctx, key, opts...)
+			}
+		}
+
 		//update response map with latest val,rev of key
+		lkv.leases.mu.Lock()
 		lkv.leases.entries[key] = &leaseInfo{response: (*v3.GetResponse)(resp.Responses[0].GetResponseRange()),
 			revision: resp.Header.Revision}
 		defer lkv.leases.mu.Unlock()
 
 		rev := resp.Header.Revision
 		//go routine - waiting for revoke message
-		go lkv.revokeRoutine(ctx, key, resp, rev)
+		go lkv.monitorLease(ctx, key, resp, rev)
+		gresp = lkv.leases.getCachedCopy(key)
 
+	} else {
+		gresp = (*v3.GetResponse)(resp.Responses[0].GetResponseRange())
 	}
 
-	resprange := resp.Responses[0].GetResponseRange()
-	response := (*v3.GetResponse)(resprange)
-	return response, nil
+	return gresp, nil
 }
