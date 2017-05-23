@@ -16,7 +16,6 @@ package leasing
 
 import (
 	"fmt"
-	"reflect"
 
 	"golang.org/x/net/context"
 
@@ -63,10 +62,6 @@ func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.Compact
 	return lkv.cl.Compact(ctx, rev, opts...)
 }
 
-func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
-	panic("Stub")
-}
-
 func (lkv *leasingKV) Do(ctx context.Context, op v3.Op) (v3.OpResponse, error) {
 	panic("Stub")
 }
@@ -86,7 +81,7 @@ func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader)
 			Version: 0,
 		}
 		lc.entries[key].response.Kvs = append(lc.entries[key].response.Kvs, myKV)
-		fmt.Println(myKV.Value)
+		//fmt.Println(myKV.Value)
 		lc.entries[key].response.More = false
 		lc.entries[key].response.Count = 1
 		lc.entries[key].response.Kvs[0].CreateRevision = respHeader.Revision
@@ -100,7 +95,6 @@ func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader)
 
 		//lc.entries[key].response.Kvs[0].Version = 0 - tackle later on delete
 		lc.entries[key].response.Kvs[0].Version++
-
 	}
 	lc.mu.Unlock()
 }
@@ -201,23 +195,46 @@ func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.Txn
 	}
 }
 
-func (lc *leaseCache) CloneValue(source interface{}, destin interface{}) {
-	x := reflect.ValueOf(source)
-	if x.Kind() == reflect.Ptr {
-		starX := x.Elem()
-		y := reflect.New(starX.Type())
-		starY := y.Elem()
-		starY.Set(starX)
-		reflect.ValueOf(destin).Elem().Set(y.Elem())
-	} else {
-		destin = x.Interface()
-	}
-}
-
 func (lc *leaseCache) getCachedCopy(key string) *v3.GetResponse {
 	resp := lc.entries[key].response
-	var copyResp *v3.GetResponse = &v3.GetResponse{}
-	lc.CloneValue(resp, copyResp)
+	header := &server.ResponseHeader{
+		ClusterId: resp.Header.ClusterId,
+		MemberId:  resp.Header.MemberId,
+		Revision:  resp.Header.Revision,
+		RaftTerm:  resp.Header.RaftTerm,
+	}
+	var keyslice []byte
+	var valslice []byte
+	var kvsslice []*mvccpb.KeyValue
+
+	if len(resp.Kvs) > 0 {
+		keyslice = make([]byte, len(resp.Kvs[0].Key))
+		valslice = make([]byte, len(resp.Kvs[0].Value))
+		copy(keyslice, resp.Kvs[0].Key)
+		copy(valslice, resp.Kvs[0].Value)
+
+		kvsslice = []*mvccpb.KeyValue{
+			&mvccpb.KeyValue{
+				Key:            keyslice,
+				CreateRevision: resp.Kvs[0].CreateRevision,
+				ModRevision:    resp.Kvs[0].ModRevision,
+				Version:        resp.Kvs[0].Version,
+				Value:          valslice,
+				Lease:          resp.Kvs[0].Lease,
+			},
+		}
+	}
+
+	if len(resp.Kvs) == 0 {
+		kvsslice = nil
+	}
+
+	copyResp := &v3.GetResponse{
+		Header: header,
+		Kvs:    kvsslice,
+		More:   resp.More,
+		Count:  resp.Count,
+	}
 	return copyResp
 }
 
@@ -229,8 +246,7 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 	var gresp *v3.GetResponse
 	//return cached value if lk exists
 	if _, ok := lkv.leases.entries[key]; ok {
-		gresp = lkv.leases.getCachedCopy(key)
-		return gresp, nil
+		return lkv.leases.getCachedCopy(key), ctx.Err()
 	}
 
 	//if range of keys exist
@@ -239,7 +255,6 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 		size := ops.RangeBytes()
 		if len(size) > 0 {
 			return lkv.cl.Get(ctx, key, opts...)
-
 		}
 	}
 
@@ -258,7 +273,7 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 		//if historical version is queried, pass through to client and don't update map
 		//	fmt.Printf("opts %+v \n", ops)
 		if len(opts) > 0 {
-			revnum := ops.RevisionNum()
+			revnum := ops.Rev()
 			//check for older revisions
 			if revnum < resp.Header.Revision {
 				return lkv.cl.Get(ctx, key, opts...)
@@ -281,4 +296,55 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 	}
 
 	return gresp, nil
+}
+
+func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOption) *v3.DeleteResponse {
+	//if leasing key revision matches with client's rev in map
+	txnDel := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
+	txnDel = txnDel.Then(v3.OpDelete(key, opts...))
+	respDel, errDel := txnDel.Commit()
+
+	if errDel != nil {
+		panic("Error in transaction")
+	}
+
+	if respDel.Succeeded {
+		lkv.leases.mu.Lock()
+		defer lkv.leases.mu.Unlock()
+		delete(lkv.leases.entries, key)
+		delresp := (*v3.DeleteResponse)(respDel.Responses[0].GetResponseDeleteRange())
+		return delresp
+	}
+	return nil
+}
+
+func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
+	for ctx.Err() == nil {
+
+		//if leasing key already exist in map, then delete key
+		if _, ok := lkv.leases.entries[key]; ok {
+			delresp := lkv.deleteKey(ctx, key, opts...)
+			return delresp, ctx.Err()
+		}
+
+		//lk doesn't exist
+		if _, ok := lkv.leases.entries[key]; !ok {
+			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
+			txn = txn.Then(v3.OpDelete(key, opts...)) //no leasing key assosciated with key, so del normally
+			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+			resp, err := txn.Commit()
+
+			if err != nil {
+				panic("Error in transaction")
+			}
+
+			if resp.Succeeded {
+				resdel := resp.Responses[0].GetResponseDeleteRange()
+				response := (*v3.DeleteResponse)(resdel)
+				return response, nil
+			}
+			lkv.watchforLKDel(ctx, key, resp.Header.Revision)
+		}
+	}
+	return nil, ctx.Err()
 }
