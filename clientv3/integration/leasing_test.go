@@ -342,3 +342,174 @@ func TestLeasingConcurrentPut(t *testing.T) {
 		t.Errorf("expected Version %d, got %d", numPuts, ver)
 	}
 }
+
+func TestLeasingDisconnectedGet(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "cached", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	// get key so it's cached
+	if _, err := lkv.Get(context.TODO(), "cached"); err != nil {
+		t.Fatal(err)
+	}
+
+	clus.Members[0].Stop(t)
+
+	// leasing key ownership should have "cached" locally served
+	cachedResp, err := lkv.Get(context.TODO(), "cached")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cachedResp.Kvs) != 1 || string(cachedResp.Kvs[0].Value) != "abc" {
+		t.Fatalf(`expected "cached"->"abc", got response %+v`, cachedResp)
+	}
+}
+
+func TestLeasingDeleteOwner(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	// get+own / delete / get
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Delete(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := lkv.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(resp.Kvs) != 0 {
+		t.Fatalf(`expected "k" to be deleted, got response %+v`, resp)
+	}
+	// try to double delete
+	if _, err := lkv.Delete(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeasingDeleteNonOwner(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv1, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lkv2, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	// acquire ownership
+	if _, err := lkv1.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	// delete via non-owner
+	if _, err := lkv2.Delete(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// key should be removed from lkv1
+	resp, err := lkv1.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) != 0 {
+		t.Fatalf(`expected "k" to be deleted, got response %+v`, resp)
+	}
+}
+
+func TestLeasingOverwriteResponse(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := lkv.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Kvs[0].Key[0] = 'z'
+	resp.Kvs[0].Value[0] = 'z'
+
+	resp, err = lkv.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(resp.Kvs[0].Key) != "k" {
+		t.Errorf(`expected key "k", got %q`, string(resp.Kvs[0].Key))
+	}
+	if string(resp.Kvs[0].Value) != "abc" {
+		t.Errorf(`expected value "abc", got %q`, string(resp.Kvs[0].Key))
+	}
+}
+
+func TestLeasingOwnerPutResponse(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	gresp, gerr := lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	presp, err := lkv.Put(context.TODO(), "k", "def")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presp == nil {
+		t.Fatal("expected put response, got nil")
+	}
+
+	clus.Members[0].Stop(t)
+
+	gresp, gerr = lkv.Get(context.TODO(), "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if gresp.Kvs[0].ModRevision != presp.Header.Revision {
+		t.Errorf("expected mod revision %d, got %d", presp.Header.Revision, gresp.Kvs[0].ModRevision)
+	}
+	if gresp.Kvs[0].Version != 2 {
+		t.Errorf("expected version 2, got version %d", gresp.Kvs[0].Version)
+	}
+}
