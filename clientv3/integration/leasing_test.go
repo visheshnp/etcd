@@ -15,8 +15,10 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/leasing"
@@ -708,8 +710,11 @@ func TestLeasingOwnerPutError(t *testing.T) {
 	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
 		t.Fatal(err)
 	}
+
 	clus.Members[0].Stop(t)
-	if resp, err := lkv.Put(context.TODO(), "k", "v"); err == nil {
+	ctx, cancel := context.WithTimeout(context.TODO(), 100*time.Millisecond)
+	defer cancel()
+	if resp, err := lkv.Put(ctx, "k", "v"); err == nil {
 		t.Fatalf("expected error, got response %+v", resp)
 	}
 }
@@ -726,8 +731,11 @@ func TestLeasingOwnerDeleteError(t *testing.T) {
 	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
 		t.Fatal(err)
 	}
+
 	clus.Members[0].Stop(t)
-	if resp, err := lkv.Delete(context.TODO(), "k"); err == nil {
+	ctx, cancel := context.WithTimeout(context.TODO(), 100*time.Millisecond)
+	defer cancel()
+	if resp, err := lkv.Delete(ctx, "k"); err == nil {
 		t.Fatalf("expected error, got response %+v", resp)
 	}
 }
@@ -736,12 +744,47 @@ func TestLeasingNonOwnerPutError(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
+
 	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	clus.Members[0].Stop(t)
-	if resp, err := lkv.Put(context.TODO(), "k", "v"); err == nil {
+	ctx, cancel := context.WithTimeout(context.TODO(), 100*time.Millisecond)
+	defer cancel()
+	if resp, err := lkv.Put(ctx, "k", "v"); err == nil {
 		t.Fatalf("expected error, got response %+v", resp)
+	}
+}
+
+func TestLeasingOwnerDeleteRange(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 8; i++ {
+		if _, err := clus.Client(0).Put(context.TODO(), fmt.Sprintf("key/%d", i), "123"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := lkv.Get(context.TODO(), "key/1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Delete(context.TODO(), "key/", clientv3.WithPrefix()); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := lkv.Get(context.TODO(), "key/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) != 0 {
+		t.Fatalf("expected no keys on key/1, got %+v", resp)
 	}
 }
