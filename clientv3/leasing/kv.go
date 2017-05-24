@@ -16,6 +16,7 @@ package leasing
 
 import (
 	"fmt"
+	"strings"
 
 	"golang.org/x/net/context"
 
@@ -66,15 +67,12 @@ func (lkv *leasingKV) Do(ctx context.Context, op v3.Op) (v3.OpResponse, error) {
 	panic("Stub")
 }
 
-func (lkv *leasingKV) Txn(ctx context.Context) v3.Txn {
-	panic("Stub")
-}
-
 //update cache's getresponse
 func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader) {
-	lc.mu.Lock()
+
 	//initialize KV struct and append to response if key doesn't exist
 	if len(lc.entries[key].response.Kvs) == 0 {
+		lc.mu.Lock()
 		myKV := &mvccpb.KeyValue{
 			Value:   []byte(val),
 			Key:     []byte(key),
@@ -85,36 +83,40 @@ func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader)
 		lc.entries[key].response.More = false
 		lc.entries[key].response.Count = 1
 		lc.entries[key].response.Kvs[0].CreateRevision = respHeader.Revision
+		lc.mu.Unlock()
 	}
 
 	// if key present, just update value and revision (//race condition tackle)
 	if len(lc.entries[key].response.Kvs) > 0 {
-		lc.entries[key].response.Header = respHeader
-		lc.entries[key].response.Kvs[0].Value = []byte(val)
-		lc.entries[key].response.Kvs[0].ModRevision = respHeader.Revision
-
+		lc.mu.Lock()
+		//fmt.Printf("revnum %+v \n", respHeader.Revision)
+		if lc.entries[key].response.Kvs[0].ModRevision < respHeader.Revision {
+			lc.entries[key].response.Header = respHeader
+			lc.entries[key].response.Kvs[0].Value = []byte(val)
+			lc.entries[key].response.Kvs[0].ModRevision = respHeader.Revision
+		}
 		//lc.entries[key].response.Kvs[0].Version = 0 - tackle later on delete
 		lc.entries[key].response.Kvs[0].Version++
+		lc.mu.Unlock()
 	}
-	lc.mu.Unlock()
 }
 
-func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3.OpOption) *v3.PutResponse {
+func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
 	//if leasing key revision matches with client's rev in map
 	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
 	txnUpd = txnUpd.Then(v3.OpPut(key, val, opts...))
 	respUpd, errUpd := txnUpd.Commit()
 
 	if errUpd != nil {
-		panic("Error in transaction")
+		return nil, errUpd
 	}
 
 	if respUpd.Succeeded {
 		lkv.leases.update(key, val, respUpd.Header)
 		putresp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
-		return putresp
+		return putresp, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) {
@@ -135,8 +137,8 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 
 		//if leasing key already exist in map, then update key
 		if _, ok := lkv.leases.entries[key]; ok {
-			putresp := lkv.updateKey(ctx, key, val, opts...)
-			return putresp, ctx.Err()
+			putresp, err := lkv.updateKey(ctx, key, val, opts...)
+			return putresp, err
 		}
 
 		//lk doesn't exist
@@ -147,13 +149,13 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 			resp, err := txn.Commit()
 
 			if err != nil {
-				panic("Error in transaction")
+				return nil, err
 			}
 
 			if resp.Succeeded {
 				resput := resp.Responses[0].GetResponsePut()
 				response := (*v3.PutResponse)(resput)
-				return response, nil
+				return response, err
 			}
 			lkv.watchforLKDel(ctx, key, resp.Header.Revision)
 		}
@@ -298,14 +300,14 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 	return gresp, nil
 }
 
-func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOption) *v3.DeleteResponse {
+func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
 	//if leasing key revision matches with client's rev in map
 	txnDel := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
 	txnDel = txnDel.Then(v3.OpDelete(key, opts...))
 	respDel, errDel := txnDel.Commit()
 
 	if errDel != nil {
-		panic("Error in transaction")
+		return nil, errDel
 	}
 
 	if respDel.Succeeded {
@@ -313,18 +315,31 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOp
 		defer lkv.leases.mu.Unlock()
 		delete(lkv.leases.entries, key)
 		delresp := (*v3.DeleteResponse)(respDel.Responses[0].GetResponseDeleteRange())
-		return delresp
+		return delresp, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
 	for ctx.Err() == nil {
-
 		//if leasing key already exist in map, then delete key
 		if _, ok := lkv.leases.entries[key]; ok {
-			delresp := lkv.deleteKey(ctx, key, opts...)
-			return delresp, ctx.Err()
+			delresp, err := lkv.deleteKey(ctx, key, opts...)
+			return delresp, err
+		}
+
+		// delete range - withprefix
+		if len(opts) > 0 {
+			ops := v3.OpGet(key, opts...)
+			//fmt.Printf("opts % +v \n", ops)
+			substr := string(ops.KeyBytes())
+			for key := range lkv.leases.entries {
+				if strings.Contains(key, substr) {
+					delete(lkv.leases.entries, key)
+					return lkv.cl.Delete(ctx, key, opts...)
+
+				}
+			}
 		}
 
 		//lk doesn't exist
@@ -335,7 +350,7 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 			resp, err := txn.Commit()
 
 			if err != nil {
-				panic("Error in transaction")
+				return nil, err
 			}
 
 			if resp.Succeeded {
@@ -347,4 +362,13 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 		}
 	}
 	return nil, ctx.Err()
+}
+
+type txnLeasing struct {
+	v3.Txn
+	lkv *leasingKV
+}
+
+func (lkv *leasingKV) Txn(ctx context.Context) v3.Txn {
+	return &txnLeasing{lkv.cl.Txn(ctx), lkv}
 }
