@@ -332,15 +332,15 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 		// delete range - withprefix
 		if len(opts) > 0 {
 			ops := v3.OpGet(key, opts...)
-			//fmt.Printf("opts % +v \n", ops)
-			substr := string(ops.KeyBytes())
-			for keyMap := range lkv.leases.entries {
-				//fmt.Println(keyMap)
-				if strings.Contains(key, substr) {
-					lkv.leases.mu.Lock()
-					delete(lkv.leases.entries, keyMap)
-					lkv.leases.mu.Unlock()
-					lkv.cl.Delete(ctx, keyMap, opts...)
+			// check if opts is of type withprefix
+			if string(ops.RangeBytes()) != string(ops.KeyBytes()) {
+				for keyMap := range lkv.leases.entries {
+					if strings.Contains(keyMap, key) {
+						lkv.leases.mu.Lock()
+						delete(lkv.leases.entries, keyMap)
+						lkv.cl.Delete(ctx, keyMap, opts...)
+						lkv.leases.mu.Unlock()
+					}
 				}
 			}
 			return nil, ctx.Err()
