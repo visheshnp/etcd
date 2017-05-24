@@ -323,6 +323,7 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOp
 func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
 	for ctx.Err() == nil {
 		//if leasing key already exist in map, then delete key
+		//fmt.Println(lkv.leases.entries)
 		if _, ok := lkv.leases.entries[key]; ok {
 			delresp, err := lkv.deleteKey(ctx, key, opts...)
 			return delresp, err
@@ -333,13 +334,16 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 			ops := v3.OpGet(key, opts...)
 			//fmt.Printf("opts % +v \n", ops)
 			substr := string(ops.KeyBytes())
-			for key := range lkv.leases.entries {
+			for keyMap := range lkv.leases.entries {
+				//fmt.Println(keyMap)
 				if strings.Contains(key, substr) {
-					delete(lkv.leases.entries, key)
-					return lkv.cl.Delete(ctx, key, opts...)
-
+					lkv.leases.mu.Lock()
+					delete(lkv.leases.entries, keyMap)
+					lkv.leases.mu.Unlock()
+					lkv.cl.Delete(ctx, keyMap, opts...)
 				}
 			}
+			return nil, ctx.Err()
 		}
 
 		//lk doesn't exist
