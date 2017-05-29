@@ -319,6 +319,7 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 
 func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
 	//if leasing key revision matches with client's rev in map
+
 	txnDel := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
 	txnDel = txnDel.Then(v3.OpDelete(key, opts...))
 	respDel, errDel := txnDel.Commit()
@@ -334,6 +335,7 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOp
 		delresp := (*v3.DeleteResponse)(respDel.Responses[0].GetResponseDeleteRange())
 		return delresp, nil
 	}
+
 	return nil, nil
 }
 
@@ -363,6 +365,7 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 				getResp, _ := lkv.cl.Get(ctx, key, opts...)
 
 				//acquire lease and add to map
+
 				for i := range getResp.Kvs {
 					if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; !ok {
 						lkv.acquireandAdd(ctx, string(getResp.Kvs[i].Key))
@@ -374,6 +377,8 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 				for i := range getResp.Kvs {
 					lkv.deleteKey(ctx, string(getResp.Kvs[i].Key))
 				}
+
+				//fmt.Println(lkv.leases.entries)
 			}
 
 		}
