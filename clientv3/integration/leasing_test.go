@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -777,14 +778,83 @@ func TestLeasingOwnerDeleteRange(t *testing.T) {
 	if _, err := lkv.Get(context.TODO(), "key/1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lkv.Delete(context.TODO(), "key/", clientv3.WithPrefix()); err != nil {
-		t.Fatal(err)
+	delResp, delErr := lkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	if delErr != nil {
+		t.Fatal(delErr)
 	}
-	resp, err := lkv.Get(context.TODO(), "key/1")
+	// confirm keys are invalidated from cache and deleted on etcd
+	for i := 0; i < 8; i++ {
+		resp, err := lkv.Get(context.TODO(), fmt.Sprintf("key/%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Kvs) != 0 {
+			t.Fatalf("expected no keys on key/%d, got %+v", i, resp)
+		}
+	}
+	// confirm keys were deleted atomically
+	w := clus.Client(0).Watch(
+		clus.Client(0).Ctx(),
+		"key/",
+		clientv3.WithRev(delResp.Header.Revision),
+		clientv3.WithPrefix())
+	if wresp := <-w; len(wresp.Events) != 8 {
+		t.Fatalf("expected %d delete events, got %d", wresp.Events)
+	}
+}
+
+func TestLeasingPutGetDeleteConcurrent(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkvs := make([]clientv3.KV, 16)
+	for i := range lkvs {
+		lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lkvs[i] = lkv
+	}
+
+	getdel := func(kv clientv3.KV) {
+		if _, err := kv.Put(context.TODO(), "k", "abc"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+		if _, err := kv.Get(context.TODO(), "k"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := kv.Delete(context.TODO(), "k"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(16)
+	for i := 0; i < 16; i++ {
+		go func() {
+			defer wg.Done()
+			for _, kv := range lkvs {
+				getdel(kv)
+			}
+		}()
+	}
+	wg.Wait()
+
+	resp, err := lkvs[0].Get(context.TODO(), "k")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Kvs) != 0 {
-		t.Fatalf("expected no keys on key/1, got %+v", resp)
+	if len(resp.Kvs) > 0 {
+		t.Fatalf("expected no kvs, got %+v", resp.Kvs)
+	}
+	resp, err = clus.Client(0).Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) > 0 {
+		t.Fatalf("expected no kvs, got %+v", resp.Kvs)
 	}
 }
