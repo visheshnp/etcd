@@ -115,10 +115,18 @@ func headerPopulate(respHeader *server.ResponseHeader) *server.ResponseHeader {
 }
 
 func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
-	//fmt.Printf("++++++++++++++UPDATE KEY OUT 1%#v\n", lkv.leases.entries[key].response)
+	var rev int64
+	lkv.leases.mu.Lock()
+	if li := lkv.leases.entries[key]; li != nil {
+		rev = li.revision
+	}
+	lkv.leases.mu.Unlock()
+	if rev == 0 {
+		return nil, nil
+	}
 
 	//if leasing key revision matches with client's rev in map
-	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
+	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev))
 	txnUpd = txnUpd.Then(v3.OpPut(key, val, opts...))
 	respUpd, errUpd := txnUpd.Commit()
 
@@ -126,16 +134,17 @@ func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3
 		return nil, errUpd
 	}
 
-	if respUpd.Succeeded {
-		//fmt.Printf("++++++++++++++UPDATE KEY OUT 2%#v\n", lkv.leases.entries)
-
-		lkv.leases.update(key, val, respUpd.Header)
-		putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
-		Header := headerPopulate(respUpd.Header)
-		putResp.Header = Header
-		return putResp, nil
+	if !respUpd.Succeeded {
+		return nil, nil
 	}
-	return nil, nil
+	//fmt.Printf("++++++++++++++UPDATE KEY OUT 2%#v\n", lkv.leases.entries)
+	lkv.leases.mu.Lock()
+	lkv.leases.update(key, val, respUpd.Header)
+	putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
+	Header := headerPopulate(respUpd.Header)
+	putResp.Header = Header
+	lkv.leases.mu.Unlock()
+	return putResp, nil
 }
 
 func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) {
@@ -155,11 +164,9 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 	for ctx.Err() == nil {
 
 		//if leasing key already exist in map, then update key
-		if _, ok := lkv.leases.entries[key]; ok {
-			//	fmt.Printf("++++++++++++++PUT OUT%#v\n", lkv.leases.entries[key].response)
-			lkv.leases.mu.Lock()
-			defer lkv.leases.mu.Unlock()
-			return lkv.updateKey(ctx, key, val, opts...)
+		resp, err := lkv.updateKey(ctx, key, val, opts...)
+		if resp != nil || err != nil {
+			return resp, err
 		}
 
 		//lk doesn't exist
