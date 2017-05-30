@@ -83,6 +83,12 @@ func (op Op) RangeBytes() []byte { return op.end }
 // Rev returns the requested revision, if any.
 func (op Op) Rev() int64 { return op.rev }
 
+// IsPut returns true iff the operation is a Put.
+func (op Op) IsPut() bool { return op.t == tPut }
+
+// IsGet returns true iff the opreation is a Get.
+func (op Op) IsGet() bool { return op.t == tRange }
+
 // WithRangeBytes sets the byte slice for the Op's range end.
 func (op *Op) WithRangeBytes(end []byte) { op.end = end }
 
