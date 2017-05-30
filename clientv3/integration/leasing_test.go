@@ -677,11 +677,15 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 		t.Fatal(err)
 	}
 	// invalidate via lkv2 txn
-	tresp, terr := lkv2.Txn(context.TODO()).Then(clientv3.OpPut("k", "def"), clientv3.OpPut("k2", "456")).Commit()
+	tresp, terr := lkv2.Txn(context.TODO()).Then(
+		clientv3.OpPut("k", "def"),
+		clientv3.OpPut("k2", "456"),
+		clientv3.OpPut("k3", "999"), // + a key not in any cache
+	).Commit()
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	if !tresp.Succeeded || len(tresp.Responses) != 2 {
+	if !tresp.Succeeded || len(tresp.Responses) != 3 {
 		t.Fatalf("expected txn success, got %+v", tresp)
 	}
 	// check cache was invalidated
@@ -698,6 +702,24 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 	}
 	if len(gresp.Kvs) != 1 || string(gresp.Kvs[0].Value) != "456" {
 		t.Errorf(`expected value "def", got %+v`, gresp)
+	}
+	// check puts were applied and are all in the same revision
+	w := clus.Client(0).Watch(
+		clus.Client(0).Ctx(),
+		"k",
+		clientv3.WithRev(tresp.Header.Revision),
+		clientv3.WithPrefix())
+	wresp := <-w
+	c := 0
+	evs := []clientv3.Event{}
+	for _, ev := range wresp.Events {
+		evs = append(evs, *ev)
+		if ev.Kv.ModRevision == tresp.Header.Revision {
+			c++
+		}
+	}
+	if c != 3 {
+		t.Fatalf("expected 3 put events, got %+v", evs)
 	}
 }
 
