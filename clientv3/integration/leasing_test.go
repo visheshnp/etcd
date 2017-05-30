@@ -195,7 +195,6 @@ func TestLeasingPutInvalidatExisting(t *testing.T) {
 
 // TestLeasingGetSerializable checks the leasing KV can make serialized requests
 // when the etcd cluster is partitioned.
-/*
 func TestLeasingGetSerializable(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 2})
@@ -233,7 +232,7 @@ func TestLeasingGetSerializable(t *testing.T) {
 		t.Fatalf(`expected no keys, got response %+v`, resp)
 	}
 }
-*/
+
 // TestLeasingPrevKey checks the cache respects the PrevKV flag on puts.
 func TestLeasingPrevKey(t *testing.T) {
 	defer testutil.AfterTest(t)
