@@ -41,6 +41,7 @@ type leasingKV struct {
 type leaseCache struct {
 	entries map[string]*leaseInfo
 	mu      sync.Mutex
+	flag    int64
 }
 
 type leaseInfo struct {
@@ -56,7 +57,7 @@ func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
 		return nil, err
 	}
 	cctx, cancel := context.WithCancel(cl.Ctx())
-	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel}, nil
+	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo), flag: 0}, ctx: cctx, cancel: cancel}, nil
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
@@ -71,24 +72,26 @@ func (lkv *leasingKV) Do(ctx context.Context, op v3.Op) (v3.OpResponse, error) {
 func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader) {
 
 	//initialize KV struct and append to response if key doesn't exist
+
+	//	fmt.Printf("++++++++++++++UPDATE OUT%#v\n", lc.entries)
+
+	//	fmt.Printf("map %+v", lc.entries[key].response)
 	if len(lc.entries[key].response.Kvs) == 0 {
-		lc.mu.Lock()
 		myKV := &mvccpb.KeyValue{
 			Value:   []byte(val),
 			Key:     []byte(key),
 			Version: 0,
 		}
 		lc.entries[key].response.Kvs = append(lc.entries[key].response.Kvs, myKV)
-		//fmt.Println(myKV.Value)
 		lc.entries[key].response.More = false
 		lc.entries[key].response.Count = 1
 		lc.entries[key].response.Kvs[0].CreateRevision = respHeader.Revision
-		lc.mu.Unlock()
+
 	}
 
 	// if key present, just update value and revision
 	if len(lc.entries[key].response.Kvs) > 0 {
-		lc.mu.Lock()
+
 		if lc.entries[key].response.Kvs[0].ModRevision < respHeader.Revision {
 			lc.entries[key].response.Header = respHeader
 			lc.entries[key].response.Kvs[0].Value = []byte(val)
@@ -96,8 +99,8 @@ func (lc *leaseCache) update(key, val string, respHeader *server.ResponseHeader)
 		}
 		//lc.entries[key].response.Kvs[0].Version = 0 - tackle later on delete
 		lc.entries[key].response.Kvs[0].Version++
-		lc.mu.Unlock()
 	}
+
 }
 
 //populates header from the TxnResponse
@@ -112,6 +115,8 @@ func headerPopulate(respHeader *server.ResponseHeader) *server.ResponseHeader {
 }
 
 func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
+	//fmt.Printf("++++++++++++++UPDATE KEY OUT 1%#v\n", lkv.leases.entries[key].response)
+
 	//if leasing key revision matches with client's rev in map
 	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
 	txnUpd = txnUpd.Then(v3.OpPut(key, val, opts...))
@@ -122,6 +127,8 @@ func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3
 	}
 
 	if respUpd.Succeeded {
+		//fmt.Printf("++++++++++++++UPDATE KEY OUT 2%#v\n", lkv.leases.entries)
+
 		lkv.leases.update(key, val, respUpd.Header)
 		putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
 		Header := headerPopulate(respUpd.Header)
@@ -149,6 +156,9 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 
 		//if leasing key already exist in map, then update key
 		if _, ok := lkv.leases.entries[key]; ok {
+			//	fmt.Printf("++++++++++++++PUT OUT%#v\n", lkv.leases.entries[key].response)
+			lkv.leases.mu.Lock()
+			defer lkv.leases.mu.Unlock()
 			return lkv.updateKey(ctx, key, val, opts...)
 		}
 
@@ -183,12 +193,13 @@ func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.Txn
 
 	for nCtx.Err() == nil {
 		wch := lkv.cl.Watch(nCtx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
-		fmt.Println("Entering goroutine")
+		//		fmt.Println("Entering goroutine")
 
 		for resp := range wch {
 			for _, ev := range resp.Events {
 
 				if string(ev.Kv.Value) == "REVOKE" {
+					//fmt.Printf("+++++ REVOKED %s \n", lkv.pfx+key)
 					txn := lkv.cl.Txn(nCtx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev))
 					txn = txn.Then(v3.OpDelete(lkv.pfx + key))
 					delResp, err := txn.Commit()
@@ -254,6 +265,7 @@ func (lkv *leasingKV) appendMap(getresp *v3.GetResponse, key string) {
 	lkv.leases.mu.Lock()
 	lkv.leases.entries[key] = &leaseInfo{response: getresp,
 		revision: getresp.Header.Revision}
+
 	defer lkv.leases.mu.Unlock()
 }
 
@@ -261,6 +273,7 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, opts ...v3.O
 	//assigns lk and insert into map
 	txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
 	txn = txn.Then(v3.OpGet(key, opts...), v3.OpPut(lkv.pfx+key, "", v3.WithLease(lkv.session.Lease())))
+
 	//returns val when no leasing key is assosciated
 	txn = txn.Else(v3.OpGet(key, opts...))
 	resp, err := txn.Commit()
@@ -272,6 +285,8 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, opts ...v3.O
 }
 
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
+	//fmt.Printf("++++++++++++++GET OUT%#v\n", lkv.leases.entries)
+
 	if len(key) == 0 {
 		return nil, rpctypes.ErrEmptyKey
 	}
@@ -319,7 +334,6 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 
 func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
 	//if leasing key revision matches with client's rev in map
-
 	txnDel := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", lkv.leases.entries[key].revision))
 	txnDel = txnDel.Then(v3.OpDelete(key, opts...))
 	respDel, errDel := txnDel.Commit()
@@ -351,6 +365,8 @@ func (lkv *leasingKV) acquireandAdd(ctx context.Context, key string) {
 }
 
 func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
+	//fmt.Printf("+++++++++++++DELETE OUT%#v\n", lkv.leases.entries)
+
 	for ctx.Err() == nil {
 		//if leasing key already exist in map, then delete key
 		if _, ok := lkv.leases.entries[key]; ok {
@@ -372,15 +388,13 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 					}
 				}
 
-				//should make more modifications:
-				/* check for modrevision on last key in the range and delete - need more support*/
-				for i := range getResp.Kvs {
-					lkv.deleteKey(ctx, string(getResp.Kvs[i].Key))
-				}
+				/*	//should make more modifications: - make delete range atomic using txns
+					check for modrevision on last key in the range and delete - need more support
+					for i := range getResp.Kvs {
+						//lkv.deleteKey(ctx, string(getResp.Kvs[i].Key))
 
-				//fmt.Println(lkv.leases.entries)
+					}*/
 			}
-
 		}
 
 		//lk doesn't exist
@@ -395,8 +409,7 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 			}
 
 			if resp.Succeeded {
-				resdel := resp.Responses[0].GetResponseDeleteRange()
-				response := (*v3.DeleteResponse)(resdel)
+				response := (*v3.DeleteResponse)(resp.Responses[0].GetResponseDeleteRange())
 				return response, nil
 			}
 			lkv.watchforLKDel(ctx, key, resp.Header.Revision)
@@ -563,7 +576,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	//copy either opst or opse into opArray
 	if boolvar {
 		opArray = append([]v3.Op(nil), txn.opst...)
-		fmt.Println(opArray)
+		//fmt.Println(opArray)
 	}
 
 	if !boolvar && len(txn.opse) != 0 {
@@ -613,6 +626,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		}
 		responseArray = append(responseArray, respOp)
 	}
+	fmt.Println(responseArray)
 
 	// latest rev - response details
 	respHeader := returnHeader(getRespArray, putRespArray)
