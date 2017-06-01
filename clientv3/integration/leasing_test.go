@@ -889,3 +889,98 @@ func TestLeasingPutGetDeleteConcurrent(t *testing.T) {
 		t.Fatalf("expected no kvs, got %+v", resp.Kvs)
 	}
 }
+
+// TestLeasingReconnectRevoke checks that revocation works if
+// disconnected when trying to submit revoke txn.
+func TestLeasingReconnectOwnerRevoke(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	lkv1, err1 := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	lkv2, err2 := leasing.NewleasingKV(clus.Client(1), "foo/")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+
+	if _, err := lkv1.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	cctx, cancel := context.WithCancel(context.TODO())
+	sdonec, pdonec := make(chan struct{}), make(chan struct{})
+	// make lkv1 connection choppy so txns fail
+	go func() {
+		defer close(sdonec)
+		for cctx.Err() == nil {
+			clus.Members[0].Stop(t)
+			time.Sleep(100 * time.Millisecond)
+			clus.Members[0].Restart(t)
+		}
+	}()
+	go func() {
+		defer close(pdonec)
+		if _, err := lkv2.Put(cctx, "k", "v"); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	select {
+	case <-pdonec:
+		cancel()
+		<-sdonec
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-sdonec
+		<-pdonec
+		t.Fatal("took to long to revoke and put")
+	}
+}
+
+// TestLeasingReconnectOwnerPut checks a put error on an owner will
+// not cause inconsistency between the server and the client.
+func TestLeasingReconnectOwnerPut(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; true; i++ {
+		v := fmt.Sprintf("%d", i)
+		donec := make(chan struct{})
+		clus.Members[0].DropConnections()
+		go func() {
+			defer close(donec)
+			for i := 0; i < 10; i++ {
+				clus.Members[0].DropConnections()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		_, err = lkv.Put(context.TODO(), "k", v)
+		<-donec
+		if err != nil {
+			break
+		}
+	}
+
+	lresp, lerr := lkv.Get(context.TODO(), "k")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	cresp, cerr := clus.Client(0).Get(context.TODO(), "k")
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	if !reflect.DeepEqual(lresp.Kvs, cresp.Kvs) {
+		t.Fatalf("expected %+v, got %+v", cresp, lresp)
+	}
+}
