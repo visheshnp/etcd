@@ -571,23 +571,22 @@ func (txn *txnLeasing) applyCmps() []bool {
 }
 
 //return header with largest rev number
-func returnHeader(getRespArray []*v3.GetResponse, putRespArray []*v3.PutResponse) *server.ResponseHeader {
-	respHeader := &server.ResponseHeader{}
+func returnRev(respArray []*server.ResponseOp) int64 {
 	rev := int64(0)
-	for i := range getRespArray {
-		if getRespArray[i].Header.Revision > rev {
-			rev = getRespArray[i].Header.Revision
-			respHeader = getRespArray[i].Header
+	for i := range respArray {
+		if (*v3.GetResponse)(respArray[i].GetResponseRange()) != nil {
+			if (*v3.GetResponse)(respArray[i].GetResponseRange()).Header.Revision > rev {
+				rev = (*v3.GetResponse)(respArray[i].GetResponseRange()).Header.Revision
+			}
 		}
-	}
 
-	for i := range putRespArray {
-		if putRespArray[i].Header.Revision > rev {
-			rev = putRespArray[i].Header.Revision
-			respHeader = putRespArray[i].Header
+		if (*v3.PutResponse)(respArray[i].GetResponsePut()) != nil {
+			if (*v3.PutResponse)(respArray[i].GetResponsePut()).Header.Revision > rev {
+				rev = (*v3.PutResponse)(respArray[i].GetResponsePut()).Header.Revision
+			}
 		}
 	}
-	return respHeader
+	return rev
 }
 
 func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
@@ -609,73 +608,127 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	}
 
 	var txnResp *v3.TxnResponse
-	getRespArray := make([]*v3.GetResponse, 0)
-	putRespArray := make([]*v3.PutResponse, 0)
 	var i int
-	responseArray := make([]*server.ResponseOp, 0)
 	respOp := &server.ResponseOp{}
 	opArray := make([]v3.Op, 0)
 
 	//copy either opst or opse into opArray
 	if boolvar {
 		opArray = append([]v3.Op(nil), txn.opst...)
-		//fmt.Println(opArray)
 	}
 
 	if !boolvar && len(txn.opse) != 0 {
 		opArray = append([]v3.Op(nil), txn.opse...)
-		//copy(opArray, txn.opse)
 	}
 
-	//append responseOp's for get/put operations to responsearray
+	//populate IF for comparsions
+	ifCmps := make([]v3.Cmp, len(opArray))
+	elseOps := make([]v3.Op, len(opArray))
+	ifCmps, elseOps = nil, nil
+	respHeader := &server.ResponseHeader{}
+	thenOps := make([]v3.Op, 0)
+	pos := make([]int, 0)
+	responseArray := make([]*server.ResponseOp, len(opArray))
+
 	for i = range opArray {
-		if (opArray[i]).IsGet() { //opget
-			//check if present in cache
-			if _, ok := txn.lkv.leases.entries[string(opArray[i].KeyBytes())]; ok {
-				getRespArray = append(getRespArray, (txn.lkv).leases.getCachedCopy(string(opArray[i].KeyBytes())))
-			}
+		key := string(opArray[i].KeyBytes())
 
+		//if present in cache and opget(), populate TxnResponses
+		if li := txn.lkv.leases.entries[key]; li != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(getRespArray[i])},
+				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(key))},
 			}
+			responseArray[i] = respOp
 		}
-		//opput
-		if (opArray[i]).IsPut() {
-			var putresp *v3.PutResponse
-			//if in cache
-			if _, ok := txn.lkv.leases.entries[string(opArray[i].KeyBytes())]; ok {
-				pr, err := txn.lkv.updateKey(txn.lkv.cl.Ctx(), string(opArray[i].KeyBytes()), string(opArray[i].ValueBytes()))
-				putresp = pr
 
-				if err != nil {
-					return nil, err
-				}
-			}
+		//ifCmps - if either opPut or not in cache then populate thenOps and ifCmps
+		var rev int64
+		txn.lkv.leases.mu.Lock()
 
-			//not in cache - has to revoke (nonowner)
-			if _, ok := txn.lkv.leases.entries[string(opArray[i].KeyBytes())]; !ok {
-				pr, err := txn.lkv.Put(txn.lkv.cl.Ctx(), string(opArray[i].KeyBytes()), string(opArray[i].ValueBytes()))
-				putresp = pr
-
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			putRespArray = append(putRespArray, putresp)
-			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponsePut{(*server.PutResponse)(putRespArray[i])},
-			}
+		if li := txn.lkv.leases.entries[key]; li != nil {
+			rev = li.revision
 		}
-		responseArray = append(responseArray, respOp)
+		txn.lkv.leases.mu.Unlock()
+
+		if opArray[i].IsPut() {
+			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
+		}
+
+		if li := txn.lkv.leases.entries[key]; li == nil && opArray[i].IsGet() {
+			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", rev-1))
+		}
+
+		thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
+		pos = append(pos, i)
+		responseArray[i] = nil
+		elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 	}
 
-	// latest rev - response details
-	respHeader := returnHeader(getRespArray, putRespArray)
-	header := headerPopulate(respHeader)
-	//populate txnresp and return
+	//Perform Txn
+	flag := true
+
+	//repeat until success
+	for flag == true {
+		txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(ifCmps...)
+		txn1 = txn1.Then(thenOps...)
+		txn1 = txn1.Else(elseOps...)
+		resp, err := txn1.Commit()
+
+		if err != nil {
+			return nil, err
+		}
+
+		if !resp.Succeeded {
+			for i = 0; i < len(thenOps); i++ {
+				key := string(thenOps[i].KeyBytes())
+				response := (*v3.GetResponse)(resp.Responses[i].GetResponseRange())
+
+				// Invalidate owner
+				if li := txn.lkv.leases.entries[key]; li == nil && len(response.Kvs) != 0 && thenOps[i].IsPut() {
+					txn1 = txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).Then(v3.OpPut(txn.lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+					revokeResp, err := txn1.Commit()
+
+					//wait until deleted from server
+					if revokeResp.Succeeded {
+						txn.lkv.watchforLKDel((txn.lkv.cl.Ctx()), string(thenOps[i].KeyBytes()), revokeResp.Header.Revision)
+					}
+
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+
+		if resp.Succeeded {
+			for i = 0; i < len(thenOps); i++ {
+				key := string(thenOps[i].KeyBytes())
+
+				//update cache on a successful put, if owns lk
+				if li := txn.lkv.leases.entries[key]; li != nil && thenOps[i].IsPut() {
+					txn.lkv.leases.update(key, string(thenOps[i].ValueBytes()), resp.Header)
+				}
+
+				//populate responseArray
+				responseArray[pos[i]] = resp.Responses[i]
+			}
+			flag = false
+
+			//populate respHeader
+			respHeader = &server.ResponseHeader{
+				ClusterId: resp.Header.ClusterId,
+				MemberId:  resp.Header.MemberId,
+				RaftTerm:  resp.Header.RaftTerm,
+			}
+		}
+	}
+
+	// latest rev
+	respHeader.Revision = returnRev(responseArray)
+
+	//populate txnResp and return
 	txnResp = &v3.TxnResponse{
-		Header:    header,
+		Header:    respHeader,
 		Succeeded: boolvar,
 		Responses: responseArray,
 	}
