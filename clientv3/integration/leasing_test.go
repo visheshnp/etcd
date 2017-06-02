@@ -16,6 +16,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"reflect"
 	"sync"
 	"testing"
@@ -721,6 +722,127 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 	if c != 3 {
 		t.Fatalf("expected 3 put events, got %+v", evs)
 	}
+}
+
+// TestLeasingTxnRandIfThen randomly leases keys two separate clients, then
+// issues a random If/Then transaction on those keys to one client.
+func TestLeasingTxnRandIfThen(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv1, err1 := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	lkv2, err2 := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+
+	keyCount := 16
+	dat := make([]*clientv3.PutResponse, keyCount)
+	for i := 0; i < keyCount; i++ {
+		k, v := fmt.Sprintf("k-%d", i), fmt.Sprintf("%d", i)
+		dat[i], err1 = clus.Client(0).Put(context.TODO(), k, v)
+		if err1 != nil {
+			t.Fatal(err1)
+		}
+	}
+
+	// nondeterministically populate leasing caches
+	var wg sync.WaitGroup
+	getc := make(chan struct{}, keyCount)
+	getRandom := func(kv clientv3.KV) {
+		defer wg.Done()
+		for i := 0; i < keyCount/2; i++ {
+			k := fmt.Sprintf("k-%d", rand.Intn(keyCount))
+			if _, err := kv.Get(context.TODO(), k); err != nil {
+				t.Fatal(err)
+			}
+			getc <- struct{}{}
+		}
+	}
+	wg.Add(2)
+	defer wg.Wait()
+	go getRandom(lkv1)
+	go getRandom(lkv2)
+
+	// random list of comparisons, all true
+	cmps := []clientv3.Cmp{}
+	for i := 0; i < keyCount; i++ {
+		idx := rand.Intn(keyCount)
+		k := fmt.Sprintf("k-%d", idx)
+		var cmp clientv3.Cmp
+		switch rand.Intn(4) {
+		case 0:
+			cmp = clientv3.Compare(
+				clientv3.CreateRevision(k), ">", dat[idx].Header.Revision-1)
+		case 1:
+			cmp = clientv3.Compare(clientv3.Version(k), "=", 1)
+		case 2:
+			cmp = clientv3.Compare(
+				clientv3.CreateRevision(k), "=", dat[idx].Header.Revision)
+		case 3:
+			cmp = clientv3.Compare(
+				clientv3.CreateRevision(k), "!=", dat[idx].Header.Revision+1)
+
+		}
+		cmps = append(cmps, cmp)
+	}
+	// random list of puts/gets; unique keys
+	ops := []clientv3.Op{}
+	usedIdx := make(map[int]struct{})
+	for i := 0; i < keyCount; i++ {
+		idx := rand.Intn(keyCount)
+		if _, ok := usedIdx[idx]; ok {
+			continue
+		}
+		usedIdx[idx] = struct{}{}
+		k := fmt.Sprintf("k-%d", idx)
+		switch rand.Intn(2) {
+		case 0:
+			ops = append(ops, clientv3.OpGet(k))
+		case 1:
+			ops = append(ops, clientv3.OpPut(k, "a"))
+			// TODO: add delete
+		}
+	}
+	// random lengths
+	cmps = cmps[:rand.Intn(len(cmps))]
+	ops = ops[:rand.Intn(len(ops))]
+
+	// wait for some gets to populate the leasing caches before committing
+	for i := 0; i < keyCount/2; i++ {
+		<-getc
+	}
+
+	tresp, terr := lkv1.Txn(context.TODO()).If(cmps...).Then(ops...).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	// cmps always succeed
+	if !tresp.Succeeded {
+		t.Fatal("expected succeeded, got failed")
+	}
+	// get should match what was put
+	checkPuts := func(s string, kv clientv3.KV) {
+		for _, op := range ops {
+			if !op.IsPut() {
+				continue
+			}
+			resp, rerr := kv.Get(context.TODO(), string(op.KeyBytes()))
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != "a" {
+				t.Fatalf(`%s: expected value="a", got %+v`, s, resp.Kvs)
+			}
+		}
+	}
+	checkPuts("client(0)", clus.Client(0))
+	checkPuts("lkv1", lkv1)
+	checkPuts("lkv2", lkv2)
 }
 
 func TestLeasingOwnerPutError(t *testing.T) {
