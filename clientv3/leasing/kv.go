@@ -621,7 +621,15 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		opArray = append([]v3.Op(nil), txn.opse...)
 	}
 
-	//populate IF for comparsions
+	//if cond is false, and no else
+	if !boolvar && len(txn.opse) == 0 {
+		txnResp = &v3.TxnResponse{
+			Succeeded: boolvar,
+		}
+		return txnResp, nil
+	}
+
+	//populate lkvTxn IF for comparsions
 	ifCmps := make([]v3.Cmp, len(opArray))
 	elseOps := make([]v3.Op, len(opArray))
 	ifCmps, elseOps = nil, nil
@@ -652,16 +660,36 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 
 		if opArray[i].IsPut() {
 			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
+			thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
+			pos = append(pos, i)
+			responseArray[i] = nil
 		}
 
 		if li := txn.lkv.leases.entries[key]; li == nil && opArray[i].IsGet() {
 			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", rev-1))
+			thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
+			pos = append(pos, i)
+			responseArray[i] = nil
 		}
-
-		thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
-		pos = append(pos, i)
-		responseArray[i] = nil
 		elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
+	}
+
+	//if in cache, return before performing lkv Txn - base client
+	if len(thenOps) == 0 {
+		rev := returnRev(responseArray)
+		resp := (*v3.GetResponse)(responseArray[0].GetResponseRange())
+		respHeader = &server.ResponseHeader{
+			ClusterId: resp.Header.ClusterId,
+			Revision:  rev,
+			MemberId:  resp.Header.MemberId,
+			RaftTerm:  resp.Header.RaftTerm,
+		}
+		txnResp = &v3.TxnResponse{
+			Header:    respHeader,
+			Succeeded: boolvar,
+			Responses: responseArray,
+		}
+		return txnResp, nil
 	}
 
 	//Perform Txn
