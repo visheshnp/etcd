@@ -155,17 +155,18 @@ func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3
 	return putResp, nil
 }
 
-func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) {
+func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) bool {
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	wch := lkv.cl.Watch(cctx, lkv.pfx+key, v3.WithRev(rev+1))
 	for resp := range wch {
 		for _, ev := range resp.Events {
 			if ev.Type == v3.EventTypeDelete {
-				return
+				return true
 			}
 		}
 	}
+	return false
 }
 
 func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
@@ -209,10 +210,8 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
 	nCtx, cancel := context.WithCancel(lkv.ctx)
 	defer cancel()
-
 	for nCtx.Err() == nil {
 		wch := lkv.cl.Watch(nCtx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
-		//fmt.Println("Entering goroutine")
 
 		for resp := range wch {
 			for _, ev := range resp.Events {
@@ -351,8 +350,8 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 		//go routine - waiting for revoke message
 		go lkv.monitorLease(ctx, key, resp, rev)
 		gresp = lkv.leases.getCachedCopy(key)
-
-	} else {
+	}
+	if !resp.Succeeded {
 		gresp = (*v3.GetResponse)(resp.Responses[0].GetResponseRange())
 	}
 	return gresp, nil
@@ -385,7 +384,6 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, opts ...v3.OpOp
 		delresp := (*v3.DeleteResponse)(respDel.Responses[0].GetResponseDeleteRange())
 		return delresp, nil
 	}
-
 	return nil, nil
 }
 
@@ -444,6 +442,8 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 			//lk doesn't exist
 			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
 			txn = txn.Then(v3.OpDelete(key, opts...)) //no leasing key assosciated with key, so del normally
+
+			//if non owner
 			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
 			resp, err := txn.Commit()
 
@@ -474,6 +474,7 @@ func (lkv *leasingKV) Txn(ctx context.Context) v3.Txn {
 }
 
 func (txn *txnLeasing) If(cs ...v3.Cmp) v3.Txn {
+
 	for i := range cs {
 		txn.cs = append(txn.cs, cs[i])
 	}
@@ -512,8 +513,13 @@ func (txn *txnLeasing) applyCmps() []bool {
 	boolArray = nil
 	if txn.cs != nil {
 		for itr := range txn.cs {
-			if _, ok := txn.lkv.leases.entries[string(txn.cs[itr].Key)]; ok {
-				cacheResp := txn.lkv.leases.entries[string(txn.cs[itr].Key)].response
+
+			txn.lkv.leases.mu.Lock()
+			li, ok := txn.lkv.leases.entries[string(txn.cs[itr].Key)]
+			txn.lkv.leases.mu.Unlock()
+
+			if ok {
+				cacheResp := li.response
 				var result int
 				switch txn.cs[itr].Target {
 				case server.Compare_VALUE:
@@ -585,18 +591,48 @@ func returnRev(respArray []*server.ResponseOp) int64 {
 				rev = (*v3.PutResponse)(respArray[i].GetResponsePut()).Header.Revision
 			}
 		}
+		if (*v3.DeleteResponse)(respArray[i].GetResponseDeleteRange()) != nil {
+			if (*v3.DeleteResponse)(respArray[i].GetResponseDeleteRange()).Header.Revision > rev {
+				rev = (*v3.DeleteResponse)(respArray[i].GetResponseDeleteRange()).Header.Revision
+			}
+		}
 	}
 	return rev
+}
+
+func (lc *leaseCache) inCache(key string) *leaseInfo {
+	lc.mu.Lock()
+	li := lc.entries[key]
+	lc.mu.Unlock()
+	return li
+}
+
+func (txn *txnLeasing) revokeLease(key string) bool {
+	txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", 0))
+	txn1 = txn1.Then(v3.OpPut(txn.lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+	revokeResp, _ := txn1.Commit()
+
+	if revokeResp.Succeeded {
+		return txn.lkv.watchforLKDel((txn.lkv.cl.Ctx()), key, revokeResp.Header.Revision)
+	}
+
+	return false
+}
+
+func (txn *txnLeasing) clientTxn(ifCmps []v3.Cmp, thenOps []v3.Op, elseOps []v3.Op) (*v3.TxnResponse, error) {
+	txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(ifCmps...)
+	txn1 = txn1.Then(thenOps...)
+	txn1 = txn1.Else(elseOps...)
+	resp, err := txn1.Commit()
+	return resp, err
 }
 
 func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	boolvar := true
 	boolArray := txn.applyCmps()
-
 	if len(boolArray) == 1 {
 		boolvar = boolArray[0]
 	}
-
 	// more than one comparison
 	if len(boolArray) > 1 {
 		for i := range boolArray {
@@ -606,21 +642,19 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 			}
 		}
 	}
-
 	var txnResp *v3.TxnResponse
 	var i int
 	respOp := &server.ResponseOp{}
 	opArray := make([]v3.Op, 0)
-
 	//copy either opst or opse into opArray
 	if boolvar {
 		opArray = append([]v3.Op(nil), txn.opst...)
 	}
 
+	//opse
 	if !boolvar && len(txn.opse) != 0 {
 		opArray = append([]v3.Op(nil), txn.opse...)
 	}
-
 	//if cond is false, and no else
 	if !boolvar && len(txn.opse) == 0 {
 		txnResp = &v3.TxnResponse{
@@ -628,7 +662,6 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		}
 		return txnResp, nil
 	}
-
 	//populate lkvTxn IF for comparsions
 	ifCmps := make([]v3.Cmp, len(opArray))
 	elseOps := make([]v3.Op, len(opArray))
@@ -640,32 +673,29 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 
 	for i = range opArray {
 		key := string(opArray[i].KeyBytes())
-
-		//if present in cache and opget(), populate TxnResponses
-		if li := txn.lkv.leases.entries[key]; li != nil && opArray[i].IsGet() {
+		li := txn.lkv.leases.inCache(key)
+		if li != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
 				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(key))},
 			}
 			responseArray[i] = respOp
 		}
-
 		//ifCmps - if either opPut or not in cache then populate thenOps and ifCmps
-		var rev int64
+		rev := int64(0)
 		txn.lkv.leases.mu.Lock()
-
-		if li := txn.lkv.leases.entries[key]; li != nil {
+		if li != nil {
 			rev = li.revision
 		}
 		txn.lkv.leases.mu.Unlock()
 
-		if opArray[i].IsPut() {
+		if opArray[i].IsPut() || opArray[i].IsDelete() {
 			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
 			thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
 			pos = append(pos, i)
 			responseArray[i] = nil
 		}
 
-		if li := txn.lkv.leases.entries[key]; li == nil && opArray[i].IsGet() {
+		if li == nil && opArray[i].IsGet() {
 			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", rev-1))
 			thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
 			pos = append(pos, i)
@@ -674,10 +704,20 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 	}
 
-	//if in cache, return before performing lkv Txn - base client
+	//empty ops
+	if len(opArray) == 0 {
+		tresp, terr := txn.lkv.cl.Txn(txn.lkv.cl.Ctx()).If().Then().Commit()
+		if terr != nil {
+			return nil, terr
+		}
+		return tresp, nil
+	}
+
+	//if all in cache, return before performing lkv Txn - base client
 	if len(thenOps) == 0 {
+		fmt.Printf("respArrayCache %+v\n\n", responseArray)
 		rev := returnRev(responseArray)
-		resp := (*v3.GetResponse)(responseArray[0].GetResponseRange())
+		resp := (*v3.GetResponse)(responseArray[0].GetResponseRange()) //error
 		respHeader = &server.ResponseHeader{
 			ClusterId: resp.Header.ClusterId,
 			Revision:  rev,
@@ -693,15 +733,14 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	}
 
 	//Perform Txn
-	flag := true
 
+	flag := true
 	//repeat until success
 	for flag == true {
-		txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(ifCmps...)
-		txn1 = txn1.Then(thenOps...)
-		txn1 = txn1.Else(elseOps...)
-		resp, err := txn1.Commit()
-
+		/*for i, cmp := range ifCmps {
+			fmt.Printf("[%d],%+v,rev=%+v\n", i, cmp, (cmp.TargetUnion))
+		}*/
+		resp, err := txn.clientTxn(ifCmps, thenOps, elseOps)
 		if err != nil {
 			return nil, err
 		}
@@ -709,20 +748,28 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		if !resp.Succeeded {
 			for i = 0; i < len(thenOps); i++ {
 				key := string(thenOps[i].KeyBytes())
+				li := txn.lkv.leases.inCache(key)
+
+				//update cmps
+				var rev int64
+				if li != nil {
+					rev = li.revision
+				}
+				if opArray[i].IsPut() || opArray[i].IsDelete() {
+					ifCmps[i] = v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)
+				}
+			}
+
+			for i = 0; i < len(thenOps); i++ {
+				//non-owner sends REVOKE // Invalidate owner
+				key := string(thenOps[i].KeyBytes())
 				response := (*v3.GetResponse)(resp.Responses[i].GetResponseRange())
+				li := txn.lkv.leases.inCache(key)
 
-				// Invalidate owner
-				if li := txn.lkv.leases.entries[key]; li == nil && len(response.Kvs) != 0 && thenOps[i].IsPut() {
-					txn1 = txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).Then(v3.OpPut(txn.lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
-					revokeResp, err := txn1.Commit()
-
-					//wait until deleted from server
-					if revokeResp.Succeeded {
-						txn.lkv.watchforLKDel((txn.lkv.cl.Ctx()), string(thenOps[i].KeyBytes()), revokeResp.Header.Revision)
-					}
-
-					if err != nil {
-						return nil, err
+				if li == nil && len(response.Kvs) != 0 && (thenOps[i].IsPut() || thenOps[i].IsDelete()) {
+					deleteSuccess := txn.revokeLease(key)
+					if !deleteSuccess {
+						fmt.Println("failed revokeResp")
 					}
 				}
 			}
@@ -731,17 +778,18 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		if resp.Succeeded {
 			for i = 0; i < len(thenOps); i++ {
 				key := string(thenOps[i].KeyBytes())
-
-				//update cache on a successful put, if owns lk
-				if li := txn.lkv.leases.entries[key]; li != nil && thenOps[i].IsPut() {
+				li := txn.lkv.leases.inCache(key)
+				if li != nil && thenOps[i].IsPut() {
 					txn.lkv.leases.update(key, string(thenOps[i].ValueBytes()), resp.Header)
 				}
 
+				if li != nil && thenOps[i].IsDelete() {
+					txn.lkv.deleteKey(txn.lkv.cl.Ctx(), key)
+				}
 				//populate responseArray
 				responseArray[pos[i]] = resp.Responses[i]
 			}
 			flag = false
-
 			//populate respHeader
 			respHeader = &server.ResponseHeader{
 				ClusterId: resp.Header.ClusterId,
@@ -761,6 +809,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		Responses: responseArray,
 	}
 
-	fmt.Printf("txnresp %+v \n", txnResp)
+	fmt.Printf("txnresp %+v \n\n", txnResp)
+	fmt.Printf("map %+v", txn.lkv.leases.entries)
 	return txnResp, nil
 }
