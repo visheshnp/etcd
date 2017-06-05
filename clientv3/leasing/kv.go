@@ -627,21 +627,29 @@ func (txn *txnLeasing) clientTxn(ifCmps []v3.Cmp, thenOps []v3.Op, elseOps []v3.
 	return resp, err
 }
 
-func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
-	boolvar := true
+func (txn *txnLeasing) boolCmps() bool {
 	boolArray := txn.applyCmps()
-	if len(boolArray) == 1 {
-		boolvar = boolArray[0]
+	if len(boolArray) == 0 {
+		return true
 	}
+
+	if len(boolArray) == 1 {
+		return boolArray[0]
+	}
+
 	// more than one comparison
 	if len(boolArray) > 1 {
 		for i := range boolArray {
 			if boolArray[i] == false {
-				boolvar = false
-				break
+				return false
 			}
 		}
 	}
+	return true
+}
+
+func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
+	boolvar := txn.boolCmps()
 	var txnResp *v3.TxnResponse
 	var i int
 	respOp := &server.ResponseOp{}
@@ -696,7 +704,6 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		}
 
 		if li == nil && opArray[i].IsGet() {
-			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", rev-1))
 			thenOps = append(thenOps, opArray[i]) // opArray that has to go to store
 			pos = append(pos, i)
 			responseArray[i] = nil
@@ -715,7 +722,6 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 
 	//if all in cache, return before performing lkv Txn - base client
 	if len(thenOps) == 0 {
-		fmt.Printf("respArrayCache %+v\n\n", responseArray)
 		rev := returnRev(responseArray)
 		resp := (*v3.GetResponse)(responseArray[0].GetResponseRange()) //error
 		respHeader = &server.ResponseHeader{
@@ -733,20 +739,21 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	}
 
 	//Perform Txn
-
 	flag := true
+	ifCmps = append(ifCmps, txn.cs...)
 	//repeat until success
 	for flag == true {
 		/*for i, cmp := range ifCmps {
 			fmt.Printf("[%d],%+v,rev=%+v\n", i, cmp, (cmp.TargetUnion))
 		}*/
+
 		resp, err := txn.clientTxn(ifCmps, thenOps, elseOps)
 		if err != nil {
 			return nil, err
 		}
 
 		if !resp.Succeeded {
-			for i = 0; i < len(thenOps); i++ {
+			for i = 0; i < len(ifCmps)-len(txn.cs); i++ {
 				key := string(thenOps[i].KeyBytes())
 				li := txn.lkv.leases.inCache(key)
 
@@ -755,9 +762,11 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 				if li != nil {
 					rev = li.revision
 				}
+
 				if opArray[i].IsPut() || opArray[i].IsDelete() {
 					ifCmps[i] = v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)
 				}
+
 			}
 
 			for i = 0; i < len(thenOps); i++ {
