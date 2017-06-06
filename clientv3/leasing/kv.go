@@ -625,8 +625,8 @@ func (txn *txnLeasing) revokeLease(key string) bool {
 	return true
 }
 
-func (txn *txnLeasing) clientTxn(ifCmps []v3.Cmp, thenOps []v3.Op, elseOps []v3.Op) (*v3.TxnResponse, error) {
-	txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(ifCmps...)
+func (txn *txnLeasing) clientTxn(allCmps []v3.Cmp, thenOps []v3.Op, elseOps []v3.Op) (*v3.TxnResponse, error) {
+	txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(allCmps...)
 	txn1 = txn1.Then(thenOps...)
 	txn1 = txn1.Else(elseOps...)
 	resp, err := txn1.Commit()
@@ -726,9 +726,6 @@ func (txn *txnLeasing) recomputeCS() []v3.Cmp {
 			}
 		}
 	}
-
-	fmt.Println("recompCS", len(recompCS))
-	fmt.Printf("recomp CS %+v\n", recompCS)
 	return recompCS
 }
 
@@ -776,80 +773,48 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		return allInCache(responseArray, boolvar)
 	}
 
-	fmt.Println("ifCmps", len(ifCmps))
-	fmt.Println("cs", len(txn.cs))
-	fmt.Println("elseOps", len(elseOps))
-	fmt.Println("respArray", len(responseArray))
-	fmt.Println("respArray", responseArray)
-	fmt.Println("theops", thenOps)
-	fmt.Println("opArray", len(opArray))
-	fmt.Println("thenOps", len(thenOps))
-
 	//Perform Txn
 	flag := true
-	ifCmps = append(ifCmps, txn.cs...)
+	allCmps := make([]v3.Cmp, 0)
+
 	//repeat until success
 	for flag == true {
-
-		for i, cmp := range ifCmps {
-			fmt.Printf("[%d],%+v,rev=%+v\n", i, string(cmp.Key), (cmp.TargetUnion))
-		}
-
-		resp, err := txn.clientTxn(ifCmps, thenOps, elseOps)
+		allCmps = append(ifCmps, txn.cs...)
+		resp, err := txn.clientTxn(allCmps, thenOps, elseOps)
 
 		if err != nil {
 			return nil, err
 		}
 
 		if !resp.Succeeded {
-			txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx()))
-			txn1 = txn1.Then(v3.OpGet("", v3.WithPrefix()))
-			resp1, _ := txn1.Commit()
-			x := (*v3.GetResponse)(resp1.Responses[0].GetResponseRange())
-			for j := range x.Kvs {
-				fmt.Printf("serverresp %+v,rev %+v\n", string(x.Kvs[j].Key), x.Kvs[j].CreateRevision)
-			}
-
 			//update cmps
-			for i = 0; i < len(ifCmps)-len(txn.cs); i++ {
+			for i = 0; i < len(ifCmps); i++ {
 				key := string(ifCmps[i].Key)
 				li := txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx))
 
 				var rev int64
-
 				if li != nil {
 					rev = li.revision
 				}
 				ifCmps[i] = v3.Compare(v3.CreateRevision(key), "=", rev)
 			}
 
-			for i, cmp := range ifCmps {
-				fmt.Printf("after [%d],%+v,rev=%+v\n", i, string(cmp.Key), (cmp.TargetUnion))
-			}
-
 			//recompute cs
-			/*recompCS := txn.recomputeCS()
+			recompCS := txn.recomputeCS()
 			txn.cs = nil
-			fmt.Println("len txn.cs", len(txn.cs))
 			for i = range recompCS {
 				txn.cs = append(txn.cs, recompCS[i])
-			}*/
+			}
+			allCmps = nil
 
-			fmt.Println(txn.cs)
-
+			//non-owner sends REVOKE // Invalidate owner
 			for i = 0; i < len(thenOps); i++ {
-				//non-owner sends REVOKE // Invalidate owner
 				key := string(thenOps[i].KeyBytes())
 				response := (*v3.GetResponse)(resp.Responses[i].GetResponseRange())
 				li := txn.lkv.leases.inCache(key)
 
-				fmt.Printf("getresp %+v\n", response)
-
 				if li == nil && len(response.Kvs) != 0 && (thenOps[i].IsPut() || thenOps[i].IsDelete()) {
-					deleteSuccess := txn.revokeLease(key)
-					if !deleteSuccess {
-						fmt.Println("failed revokeResp")
-					}
+					txn.revokeLease(key)
 				}
 			}
 		}
