@@ -725,8 +725,8 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 }
 
 // TestLeasingTxnRandIfThen randomly leases keys two separate clients, then
-// issues a random If/Then transaction on those keys to one client.
-func TestLeasingTxnRandIfThen(t *testing.T) {
+// issues a random If/{Then,Else} transaction on those keys to one client.
+func TestLeasingTxnRandIfThenOrElse(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -769,27 +769,7 @@ func TestLeasingTxnRandIfThen(t *testing.T) {
 	go getRandom(lkv2)
 
 	// random list of comparisons, all true
-	cmps := []clientv3.Cmp{}
-	for i := 0; i < keyCount; i++ {
-		idx := rand.Intn(keyCount)
-		k := fmt.Sprintf("k-%d", idx)
-		var cmp clientv3.Cmp
-		switch rand.Intn(4) {
-		case 0:
-			cmp = clientv3.Compare(
-				clientv3.CreateRevision(k), ">", dat[idx].Header.Revision-1)
-		case 1:
-			cmp = clientv3.Compare(clientv3.Version(k), "=", 1)
-		case 2:
-			cmp = clientv3.Compare(
-				clientv3.CreateRevision(k), "=", dat[idx].Header.Revision)
-		case 3:
-			cmp = clientv3.Compare(
-				clientv3.CreateRevision(k), "!=", dat[idx].Header.Revision+1)
-
-		}
-		cmps = append(cmps, cmp)
-	}
+	cmps := randCmps("k-", dat)
 	// random list of puts/gets; unique keys
 	ops := []clientv3.Op{}
 	usedIdx := make(map[int]struct{})
@@ -817,13 +797,25 @@ func TestLeasingTxnRandIfThen(t *testing.T) {
 		<-getc
 	}
 
-	tresp, terr := lkv1.Txn(context.TODO()).If(cmps...).Then(ops...).Commit()
+	// randomly choose between then and else blocks
+	var thenOps, elseOps []clientv3.Op
+	useThen := rand.Intn(2) == 0
+	if useThen {
+		thenOps = ops
+	} else {
+		// force failure
+		cmp := clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", rand.Intn(keyCount))), "=", 0)
+		cmps = append(cmps, cmp)
+		elseOps = ops
+	}
+
+	tresp, terr := lkv1.Txn(context.TODO()).If(cmps...).Then(thenOps...).Else(elseOps...).Commit()
 	if terr != nil {
 		t.Fatal(terr)
 	}
 	// cmps always succeed
-	if !tresp.Succeeded {
-		t.Fatal("expected succeeded, got failed")
+	if tresp.Succeeded != useThen {
+		t.Fatalf("expected succeeded=%v, got tresp=%+v", useThen, tresp)
 	}
 	// get should match what was put
 	checkPuts := func(s string, kv clientv3.KV) {
@@ -1105,4 +1097,26 @@ func TestLeasingReconnectOwnerPut(t *testing.T) {
 	if !reflect.DeepEqual(lresp.Kvs, cresp.Kvs) {
 		t.Fatalf("expected %+v, got %+v", cresp, lresp)
 	}
+}
+
+func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp) {
+	for i := 0; i < len(dat); i++ {
+		idx := rand.Intn(len(dat))
+		k := fmt.Sprintf("%s%d", pfx, idx)
+		rev := dat[idx].Header.Revision
+		var cmp clientv3.Cmp
+		switch rand.Intn(4) {
+		case 0:
+			cmp = clientv3.Compare(clientv3.CreateRevision(k), ">", rev-1)
+		case 1:
+			cmp = clientv3.Compare(clientv3.Version(k), "=", 1)
+		case 2:
+			cmp = clientv3.Compare(clientv3.CreateRevision(k), "=", rev)
+		case 3:
+			cmp = clientv3.Compare(clientv3.CreateRevision(k), "!=", rev+1)
+
+		}
+		cmps = append(cmps, cmp)
+	}
+	return cmps
 }
