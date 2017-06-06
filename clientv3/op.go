@@ -86,8 +86,11 @@ func (op Op) Rev() int64 { return op.rev }
 // IsPut returns true iff the operation is a Put.
 func (op Op) IsPut() bool { return op.t == tPut }
 
-// IsGet returns true iff the opreation is a Get.
+// IsGet returns true iff the operation is a Get.
 func (op Op) IsGet() bool { return op.t == tRange }
+
+// IsDelete returns true iff the operation is a Delete.
+func (op Op) IsDelete() bool { return op.t == tDeleteRange }
 
 // WithRangeBytes sets the byte slice for the Op's range end.
 func (op *Op) WithRangeBytes(end []byte) { op.end = end }
