@@ -43,7 +43,6 @@ type leasingKV struct {
 type leaseCache struct {
 	entries map[string]*leaseInfo
 	mu      sync.Mutex
-	flag    int64
 }
 
 type leaseInfo struct {
@@ -59,7 +58,7 @@ func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
 		return nil, err
 	}
 	cctx, cancel := context.WithCancel(cl.Ctx())
-	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo), flag: 0}, ctx: cctx, cancel: cancel}, nil
+	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel}, nil
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
@@ -512,8 +511,9 @@ func compareInt64(a, b int64) int {
 
 //perform comparisons for IF statement
 func (txn *txnLeasing) applyCmps() []bool {
-	boolArray := make([]bool, len(txn.cs))
-	boolArray = nil
+	boolArray := make([]bool, 0)
+	nicArray := make([]v3.Cmp, 0)
+	boolArray, nicArray = nil, nil
 	if txn.cs != nil {
 		for itr := range txn.cs {
 
@@ -574,7 +574,22 @@ func (txn *txnLeasing) applyCmps() []bool {
 				}
 				boolArray = append(boolArray, resultbool)
 			}
+			if !ok {
+				nicArray = append(nicArray, txn.cs[itr])
+			}
 		}
+
+		txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(nicArray...)
+		txn1 = txn1.Then()
+		nicResp, _ := txn1.Commit()
+
+		if !nicResp.Succeeded {
+			boolArray = append(boolArray, false)
+		}
+		if nicResp.Succeeded {
+			boolArray = append(boolArray, true)
+		}
+
 	}
 	return boolArray
 }
@@ -636,9 +651,6 @@ func (txn *txnLeasing) clientTxn(allCmps []v3.Cmp, thenOps []v3.Op, elseOps []v3
 
 func (txn *txnLeasing) boolCmps() bool {
 	boolArray := txn.applyCmps()
-	if len(boolArray) == 0 {
-		return true
-	}
 
 	if len(boolArray) == 1 {
 		return boolArray[0]
@@ -716,8 +728,27 @@ func allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnRespon
 	return txnResp, nil
 }
 
+func (txn *txnLeasing) computeCS() []v3.Cmp {
+	compCS := make([]v3.Cmp, 0)
+	if txn.cs != nil {
+		for itr := range txn.cs {
+			li := txn.lkv.leases.inCache(string(txn.cs[itr].Key))
+			if li != nil {
+				compCS = append(compCS, txn.cs[itr])
+			}
+		}
+	}
+
+	txn.cs = nil
+	for i := range compCS {
+		txn.cs = append(txn.cs, compCS[i])
+	}
+	return compCS
+}
+
 func (txn *txnLeasing) recomputeCS() []v3.Cmp {
 	recompCS := make([]v3.Cmp, 0)
+
 	if txn.cs != nil {
 		for itr := range txn.cs {
 			li := txn.lkv.leases.inCache(string(txn.cs[itr].Key))
@@ -777,6 +808,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	flag := true
 	allCmps := make([]v3.Cmp, 0)
 
+	txn.computeCS()
 	//repeat until success
 	for flag == true {
 		allCmps = append(ifCmps, txn.cs...)
