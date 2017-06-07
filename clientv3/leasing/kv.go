@@ -135,6 +135,9 @@ func (lkv *leasingKV) updateKey(ctx context.Context, key, val string, opts ...v3
 	respUpd, errUpd := txnUpd.Commit()
 
 	if errUpd != nil {
+		//	lkv.leases.mu.Lock()
+		//	delete(lkv.leases.entries, key)
+		//	lkv.leases.mu.Unlock()
 		return nil, errUpd
 	}
 
@@ -574,9 +577,14 @@ func (txn *txnLeasing) applyCmps() []bool {
 				}
 				boolArray = append(boolArray, resultbool)
 			}
+
 			if !ok {
 				nicArray = append(nicArray, txn.cs[itr])
 			}
+		}
+
+		if len(txn.cs) == len(boolArray) {
+			return boolArray
 		}
 
 		txn1 := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(nicArray...)
@@ -778,6 +786,11 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	respHeader := &server.ResponseHeader{}
 	var i int
 	boolvar := txn.boolCmps()
+
+	fmt.Println("boolvar", boolvar)
+	fmt.Println("opse", txn.opse)
+	fmt.Println("opst", txn.opst)
+	fmt.Println("cs", txn.cs)
 
 	//if cond is false, and no else
 	if !boolvar && len(txn.opse) == 0 {
