@@ -1099,6 +1099,60 @@ func TestLeasingReconnectOwnerPut(t *testing.T) {
 	}
 }
 
+// TestLeasingReconnectNonOwnerGet checks a get error on an owner will
+// not cause inconsistency between the server and the client.
+func TestLeasingReconnectNonOwnerGet(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// populate a few keys so some leasing gets have keys
+	for i := 0; i < 4; i++ {
+		k := fmt.Sprintf("k-%d", i*2)
+		if _, err = lkv.Put(context.TODO(), k, k[2:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n := 0
+	for i := 0; true; i++ {
+		donec := make(chan struct{})
+		clus.Members[0].DropConnections()
+		go func() {
+			defer close(donec)
+			for i := 0; i < 10; i++ {
+				clus.Members[0].DropConnections()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		_, err = lkv.Get(context.TODO(), fmt.Sprintf("k-%d", i))
+		<-donec
+		n++
+		if err != nil {
+			break
+		}
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("k-%d", i)
+		lresp, lerr := lkv.Get(context.TODO(), k)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		cresp, cerr := clus.Client(0).Get(context.TODO(), k)
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		if !reflect.DeepEqual(lresp.Kvs, cresp.Kvs) {
+			t.Fatalf("expected %+v, got %+v", cresp, lresp)
+		}
+	}
+}
+
 func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp) {
 	for i := 0; i < len(dat); i++ {
 		idx := rand.Intn(len(dat))
