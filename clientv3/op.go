@@ -92,6 +92,9 @@ func (op Op) IsGet() bool { return op.t == tRange }
 // IsDelete returns true iff the operation is a Delete.
 func (op Op) IsDelete() bool { return op.t == tDeleteRange }
 
+// IsSerializable returns true if the serializable field is true.
+func (op Op) IsSerializable() bool { return op.serializable == true }
+
 // WithRangeBytes sets the byte slice for the Op's range end.
 func (op *Op) WithRangeBytes(end []byte) { op.end = end }
 
