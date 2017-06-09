@@ -41,6 +41,7 @@ type leaseCache struct {
 }
 
 type leaseInfo struct {
+	waitc    chan struct{}
 	response *v3.GetResponse
 	revision int64
 }
@@ -115,8 +116,13 @@ func respHeaderPopulate(respHeader *server.ResponseHeader) *server.ResponseHeade
 
 func (lkv *leasingKV) updateCache(ctx context.Context, key, val string, opts ...v3.OpOption) (*v3.PutResponse, error) {
 	var rev int64
+	var wc chan struct{}
 	if li := lkv.leases.inCache(key); li != nil {
+		lkv.leases.mu.Lock()
+		li.waitc = make(chan struct{})
+		wc = li.waitc
 		rev = li.revision
+		lkv.leases.mu.Unlock()
 	}
 	if rev == 0 {
 		return nil, nil
@@ -124,11 +130,18 @@ func (lkv *leasingKV) updateCache(ctx context.Context, key, val string, opts ...
 	txnUpd := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev)).Then(v3.OpPut(key, val, opts...))
 	respUpd, errUpd := txnUpd.Commit()
 	if errUpd != nil {
+		lkv.leases.deleteKeyInCache(key)
+		close(wc)
 		return nil, errUpd
+	}
+
+	if !respUpd.Succeeded {
+		return nil, nil
 	}
 	if respUpd.Succeeded && lkv.leases.inCache(key) != nil {
 		lkv.leases.updateCacheResp(key, val, respUpd.Header)
 	}
+	close(wc)
 	putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
 	putResp.Header = respHeaderPopulate(respUpd.Header)
 	return putResp, nil
@@ -195,12 +208,29 @@ func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.Txn
 	}
 }
 
-func (lc *leaseCache) getCachedCopy(key string) *v3.GetResponse {
-	var resp *v3.GetResponse
+func (lc *leaseCache) returnChannel(key string) (*leaseInfo, chan struct{}) {
+	li := lc.inCache(key)
 	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	if li := lc.entries[key]; li != nil {
-		resp = lc.entries[key].response
+	if li != nil {
+		wc := li.waitc
+		lc.mu.Unlock()
+		return li, wc
+	}
+	lc.mu.Unlock()
+	return li, nil
+}
+
+func (lc *leaseCache) getCachedCopy(ctx context.Context, key string) *v3.GetResponse {
+	var resp *v3.GetResponse
+	li, wc := lc.returnChannel(key)
+	if li != nil {
+		select {
+		case <-wc:
+			resp = li.response
+			break
+		case <-ctx.Done():
+			return nil
+		}
 	}
 	if resp == nil {
 		return nil
@@ -237,28 +267,36 @@ func (lc *leaseCache) getCachedCopy(key string) *v3.GetResponse {
 
 func (lkv *leasingKV) appendMap(getresp *v3.GetResponse, key string) {
 	lkv.leases.mu.Lock()
-	lkv.leases.entries[key] = &leaseInfo{response: getresp, revision: getresp.Header.Revision}
+	waitc := make(chan struct{})
+	close(waitc)
+	lkv.leases.entries[key] = &leaseInfo{waitc: waitc, response: getresp, revision: getresp.Header.Revision}
 	lkv.leases.mu.Unlock()
 }
 
-func (lkv *leasingKV) acquireLease(ctx context.Context, key string, opts ...v3.OpOption) *v3.TxnResponse {
+func (lkv *leasingKV) acquireLease(ctx context.Context, key string, opts ...v3.OpOption) (*v3.TxnResponse, error) {
 	txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
 	txn = txn.Then(v3.OpGet(key, opts...), v3.OpPut(lkv.pfx+key, "", v3.WithLease(lkv.session.Lease())))
 	txn = txn.Else(v3.OpGet(key, opts...))
-	resp, _ := txn.Commit()
-	return resp
+	resp, err := txn.Commit()
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
 	var gresp *v3.GetResponse
-	getResp, err := lkv.leases.getCachedCopy(key), ctx.Err()
+	getResp, err := lkv.leases.getCachedCopy(ctx, key), ctx.Err()
 	if getResp != nil || err != nil {
 		return getResp, err
 	}
 	if len(opts) > 0 && len(v3.OpGet(key, opts...).RangeBytes()) > 0 {
 		return lkv.cl.Get(ctx, key, opts...)
 	}
-	resp := lkv.acquireLease(ctx, key, opts...)
+	resp, err := lkv.acquireLease(ctx, key, opts...)
+	if err != nil {
+		return nil, err
+	}
 	if resp.Succeeded {
 		if len(opts) > 0 && (v3.OpGet(key, opts...).Rev()) < resp.Header.Revision {
 			return lkv.cl.Get(ctx, key, opts...)
@@ -267,11 +305,12 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 		getResp.Header = respHeaderPopulate(resp.Header)
 		lkv.appendMap(getResp, key)
 		go lkv.monitorLease(ctx, key, resp, resp.Header.Revision)
-		gresp = lkv.leases.getCachedCopy(key)
+		gresp = lkv.leases.getCachedCopy(ctx, key)
 	}
 	if !resp.Succeeded {
 		gresp = (*v3.GetResponse)(resp.Responses[0].GetResponseRange())
 	}
+
 	return gresp, nil
 }
 
@@ -515,7 +554,7 @@ func (txn *txnLeasing) populateOpArray(opArray []v3.Op) ([]*server.ResponseOp, [
 		}
 		if li != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(key))},
+				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.lkv.ctx, key))},
 			}
 			responseArray[i] = respOp
 		}
