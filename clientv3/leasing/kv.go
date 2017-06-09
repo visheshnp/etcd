@@ -293,6 +293,10 @@ func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) 
 	if len(opts) > 0 && len(v3.OpGet(key, opts...).RangeBytes()) > 0 {
 		return lkv.cl.Get(ctx, key, opts...)
 	}
+	if len(opts) > 0 && v3.OpGet(key, opts...).IsSerializable() {
+		return lkv.cl.Get(ctx, key, opts...)
+	}
+
 	resp, err := lkv.acquireLease(ctx, key, opts...)
 	if err != nil {
 		return nil, err
