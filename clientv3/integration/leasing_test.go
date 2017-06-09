@@ -112,7 +112,7 @@ func TestLeasingInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keys := []string{"abc/a", "abc/b", "abc/c"}
+	keys := []string{"abc/a", "abc/b", "abc/a/a"}
 	for _, k := range keys {
 		if _, err := clus.Client(0).Put(context.TODO(), k, "v"); err != nil {
 			t.Fatal(err)
@@ -124,6 +124,19 @@ func TestLeasingInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(resp.Kvs) != 3 {
+		t.Fatalf("expected keys %+v, got response keys %+v", keys, resp.Kvs)
+	}
+
+	// load into cache
+	if resp, err = lkv.Get(context.TODO(), "abc/a"); err != nil {
+		t.Fatal(err)
+	}
+
+	// get when prefix is also a cached key
+	if resp, err = lkv.Get(context.TODO(), "abc/a", clientv3.WithPrefix()); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) != 2 {
 		t.Fatalf("expected keys %+v, got response keys %+v", keys, resp.Kvs)
 	}
 }
@@ -215,15 +228,6 @@ func TestLeasingGetSerializable(t *testing.T) {
 
 	clus.Members[1].Stop(t)
 
-	// leasing key ownership should have "cached" locally served
-	cachedResp, err := lkv.Get(context.TODO(), "cached", clientv3.WithSerializable())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cachedResp.Kvs) != 1 || string(cachedResp.Kvs[0].Value) != "abc" {
-		t.Fatalf(`expected "cached"->"abc", got response %+v`, cachedResp)
-	}
-
 	// don't necessarily try to acquire leasing key ownership for new key
 	resp, err := lkv.Get(context.TODO(), "uncached", clientv3.WithSerializable())
 	if err != nil {
@@ -231,6 +235,17 @@ func TestLeasingGetSerializable(t *testing.T) {
 	}
 	if len(resp.Kvs) != 0 {
 		t.Fatalf(`expected no keys, got response %+v`, resp)
+	}
+
+	clus.Members[0].Stop(t)
+
+	// leasing key ownership should have "cached" locally served
+	cachedResp, err := lkv.Get(context.TODO(), "cached", clientv3.WithSerializable())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cachedResp.Kvs) != 1 || string(cachedResp.Kvs[0].Value) != "abc" {
+		t.Fatalf(`expected "cached"->"abc", got response %+v`, cachedResp)
 	}
 }
 
@@ -295,6 +310,30 @@ func TestLeasingRevGet(t *testing.T) {
 	}
 	if len(getResp.Kvs) != 1 || string(getResp.Kvs[0].Value) != "def" {
 		t.Fatalf(`expeted "k"->"abc" at rev=%d, got response %+v`, putResp.Header.Revision, getResp)
+	}
+}
+
+// TestLeasingGetKeysOnly checks only keys are returnd with keys only
+func TestLeasingGetKeysOnly(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k", clientv3.WithKeysOnly()); err != nil {
+		t.Fatal(err)
+	}
+
+	clus.Members[0].Stop(t)
+
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
 	}
 }
 
