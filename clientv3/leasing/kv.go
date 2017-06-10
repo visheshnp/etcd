@@ -223,6 +223,8 @@ func (lc *leaseCache) returnChannel(key string) (*leaseInfo, chan struct{}) {
 
 func (lc *leaseCache) getCachedCopy(ctx context.Context, key string, opts ...v3.OpOption) *v3.GetResponse {
 	var resp *v3.GetResponse
+	ops := v3.OpGet(key, opts...)
+	fmt.Println(ops)
 	li, wc := lc.returnChannel(key)
 	if li != nil {
 		select {
@@ -238,37 +240,33 @@ func (lc *leaseCache) getCachedCopy(ctx context.Context, key string, opts ...v3.
 	}
 	var keyCopy, valCopy []byte
 	var kvs []*mvccpb.KeyValue
-	if len(resp.Kvs) > 0 {
+	flag := true
+	if len(resp.Kvs) == 0 || ops.IsCountOnly() || (ops.IsMaxModRev() != 0 && ops.IsMaxModRev() <= resp.Kvs[0].ModRevision) ||
+		(ops.IsMaxCreateRev() != 0 && ops.IsMaxCreateRev() <= resp.Kvs[0].CreateRevision) ||
+		(ops.IsMinModRev() != 0 && ops.IsMinModRev() >= resp.Kvs[0].ModRevision) ||
+		(ops.IsMinCreateRev() != 0 && ops.IsMinCreateRev() >= resp.Kvs[0].CreateRevision) {
+		kvs = nil
+		flag = false
+	}
+
+	if len(resp.Kvs) > 0 && flag {
 		keyCopy = make([]byte, len(resp.Kvs[0].Key))
 		copy(keyCopy, resp.Kvs[0].Key)
-		if !v3.OpGet(key, opts...).IsKeysOnly() {
+		if !ops.IsKeysOnly() {
 			valCopy = make([]byte, len(resp.Kvs[0].Value))
 			copy(valCopy, resp.Kvs[0].Value)
-			kvs = []*mvccpb.KeyValue{
-				&mvccpb.KeyValue{
-					Key:            keyCopy,
-					CreateRevision: resp.Kvs[0].CreateRevision,
-					ModRevision:    resp.Kvs[0].ModRevision,
-					Version:        resp.Kvs[0].Version,
-					Value:          valCopy,
-					Lease:          resp.Kvs[0].Lease,
-				},
-			}
 		}
-		if v3.OpGet(key, opts...).IsKeysOnly() {
-			kvs = []*mvccpb.KeyValue{
-				&mvccpb.KeyValue{
-					Key:            keyCopy,
-					CreateRevision: resp.Kvs[0].CreateRevision,
-					ModRevision:    resp.Kvs[0].ModRevision,
-					Version:        resp.Kvs[0].Version,
-					Lease:          resp.Kvs[0].Lease,
-				},
-			}
+
+		kvs = []*mvccpb.KeyValue{
+			&mvccpb.KeyValue{
+				Key:            keyCopy,
+				CreateRevision: resp.Kvs[0].CreateRevision,
+				ModRevision:    resp.Kvs[0].ModRevision,
+				Version:        resp.Kvs[0].Version,
+				Value:          valCopy,
+				Lease:          resp.Kvs[0].Lease,
+			},
 		}
-	}
-	if len(resp.Kvs) == 0 {
-		kvs = nil
 	}
 	copyResp := &v3.GetResponse{
 		Header: respHeaderPopulate(resp.Header),
@@ -298,47 +296,65 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, opts ...v3.O
 	return resp, nil
 }
 
-/*func cacheOps(opts ...v3.OpOption) bool {
+func (lc *leaseCache) cacheOps(key string, opts ...v3.OpOption) bool {
+	ops := v3.OpGet(key, opts...)
+	count := 0
+	cmps := make([]bool, 0)
 
-}*/
+	if len(opts) > 0 {
+		cmps = append(cmps, ops.IsKeysOnly(), ops.IsCountOnly(), ops.IsMaxModRev() > 0, ops.IsMinModRev() > 0, ops.IsSort(), ops.IsMinCreateRev() > 0,
+			ops.IsMaxCreateRev() > 0, ops.IsLimit() >= 0, (ops.IsSerializable() && lc.inCache(key) != nil))
+		for i := range cmps {
+			if cmps[i] == true {
+				count++
+			}
+		}
+		if count != len(opts) {
+			return false
+		}
+		boolCmps := ops.IsKeysOnly() || ops.IsCountOnly() || ops.IsMaxModRev() > 0 || ops.IsMinModRev() > 0 || ops.IsSort() || ops.IsMinCreateRev() > 0 ||
+			ops.IsMaxCreateRev() > 0 || (ops.IsSerializable() && lc.inCache(key) != nil)
+		if ops.IsLimit() >= 0 && len(opts) == 1 {
+			return true
+		}
+		return boolCmps
+	}
+	return true
+}
+
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
-	fmt.Printf("opts %+v\n", v3.OpGet(key, opts...))
 	if len(opts) > 0 && len(v3.OpGet(key, opts...).RangeBytes()) > 0 {
 		return lkv.cl.Get(ctx, key, opts...)
 	}
 	var gresp *v3.GetResponse
-	getResp, err := lkv.leases.getCachedCopy(ctx, key, opts...), ctx.Err()
-	if getResp != nil || err != nil {
-		return getResp, err
+	if lkv.leases.cacheOps(key, opts...) {
+		getResp, err := lkv.leases.getCachedCopy(ctx, key, opts...), ctx.Err()
+		if getResp != nil || err != nil {
+			return getResp, err
+		}
 	}
 	if len(opts) > 0 && v3.OpGet(key, opts...).IsSerializable() {
 		return lkv.cl.Get(ctx, key, opts...)
 	}
-
 	resp, err := lkv.acquireLease(ctx, key, opts...)
-
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.Succeeded {
-		if !v3.OpGet(key, opts...).IsKeysOnly() {
-			if len(opts) > 0 && (v3.OpGet(key, opts...).Rev()) < resp.Header.Revision {
-				return lkv.cl.Get(ctx, key, opts...)
-			}
+	if !(v3.OpGet(key, opts...).IsKeysOnly()) {
+		if len(opts) > 0 && (v3.OpGet(key, opts...).Rev()) < resp.Header.Revision {
+			return lkv.cl.Get(ctx, key, opts...)
 		}
-
+	}
+	if resp.Succeeded {
 		getResp := (*v3.GetResponse)(resp.Responses[0].GetResponseRange())
 		getResp.Header = respHeaderPopulate(resp.Header)
 		lkv.appendMap(getResp, key)
-		fmt.Printf("map %+v\n", lkv.leases.entries[key])
 		go lkv.monitorLease(ctx, key, resp, resp.Header.Revision)
 		gresp = lkv.leases.getCachedCopy(ctx, key)
 	}
 	if !resp.Succeeded {
 		gresp = (*v3.GetResponse)(resp.Responses[0].GetResponseRange())
 	}
-
 	return gresp, nil
 }
 
