@@ -69,12 +69,8 @@ func TestLeasingPutGet1(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if string(resp1.Kvs[0].Key) != "abc" {
-		t.Errorf("expected key=%q, got key=%q", "abc", resp1.Kvs[0].Key)
-	}
-
-	if string(resp1.Kvs[0].Value) != "def" {
-		t.Errorf("expected value=%q, got value=%q", "bar", resp1.Kvs[0].Value)
+	if len(resp1.Kvs) != 0 {
+		t.Errorf("expected nil, got %q", resp1.Kvs[0].Key)
 	}
 
 	if string(resp2.Kvs[0].Key) != "abc" {
