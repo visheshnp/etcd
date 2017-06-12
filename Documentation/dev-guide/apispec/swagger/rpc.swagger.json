@@ -1466,6 +1466,11 @@
           "type": "string",
           "format": "byte",
           "description": "value is the value of the given key, in bytes."
+        },
+        "range_end": {
+          "type": "string",
+          "format": "byte",
+          "description": "range_end compares over the range [key, range_end). See RangeRequest."
         }
       }
     },
