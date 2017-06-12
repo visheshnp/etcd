@@ -330,13 +330,13 @@ func TestLeasingGetKeysOnly(t *testing.T) {
 	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lkv.Get(context.TODO(), "k", clientv3.WithKeysOnly()); err != nil {
+	if _, err := lkv.Get(context.TODO(), "k", clientv3.WithKeysOnly(), clientv3.WithRev(1)); err != nil {
 		t.Fatal(err)
 	}
 
 	clus.Members[0].Stop(t)
 
-	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+	if _, err := lkv.Get(context.TODO(), "k", clientv3.WithKeysOnly()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -594,10 +594,14 @@ func TestLeasingTxnOwnerGet(t *testing.T) {
 
 	var thenOps, elseOps []clientv3.Op
 	cmps, useThen := randCmps("k-", presps)
+	fmt.Printf("cmps %+v\n", cmps)
+	fmt.Printf("useThen %+v\n", useThen)
 	if useThen {
+		fmt.Printf("thenops %+v\n", ops)
 		thenOps = ops
 		elseOps = []clientv3.Op{clientv3.OpPut("k", "1")}
 	} else {
+		fmt.Printf("elseops %+v\n", ops)
 		thenOps = []clientv3.Op{clientv3.OpPut("k", "1")}
 		elseOps = ops
 	}
@@ -606,6 +610,10 @@ func TestLeasingTxnOwnerGet(t *testing.T) {
 		If(cmps...).
 		Then(thenOps...).
 		Else(elseOps...).Commit()
+
+	fmt.Printf("lastput %+v\n", presps[len(presps)-1])
+	fmt.Printf("tresp %+v\n", tresp)
+
 	if terr != nil {
 		t.Fatal(terr)
 	}
@@ -842,6 +850,8 @@ func TestLeasingTxnRandIfThenOrElse(t *testing.T) {
 
 	// random list of comparisons, all true
 	cmps, useThen := randCmps("k-", dat)
+	fmt.Println(useThen)
+	fmt.Println(len(cmps))
 	// random list of puts/gets; unique keys
 	ops := []clientv3.Op{}
 	usedIdx := make(map[int]struct{})
@@ -1245,6 +1255,7 @@ func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, the
 		return cmps, true
 	}
 	i := rand.Intn(len(dat))
+	fmt.Println("here")
 	cmps = append(cmps, clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", i)), "=", 0))
 	return cmps, false
 }
