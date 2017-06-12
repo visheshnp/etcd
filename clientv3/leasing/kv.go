@@ -16,9 +16,10 @@ package leasing
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"sync"
+
+	"fmt"
 
 	v3 "github.com/coreos/etcd/clientv3"
 	concurrency "github.com/coreos/etcd/clientv3/concurrency"
@@ -34,6 +35,8 @@ type leasingKV struct {
 	leases  leaseCache
 	ctx     context.Context
 	cancel  context.CancelFunc
+	header  *server.ResponseHeader
+	maxRev  int64
 }
 
 type leaseCache struct {
@@ -54,7 +57,7 @@ func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
 		return nil, err
 	}
 	cctx, cancel := context.WithCancel(cl.Ctx())
-	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel}, nil
+	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1}, nil
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
@@ -81,7 +84,6 @@ func (lc *leaseCache) deleteKeyInCache(key string) {
 
 func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.ResponseHeader) {
 	lc.mu.Lock()
-	defer lc.mu.Unlock()
 	mapResp := lc.entries[key].response
 	if len(mapResp.Kvs) == 0 {
 		myKV := &mvccpb.KeyValue{
@@ -103,6 +105,7 @@ func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.Respon
 		}
 		mapResp.Kvs[0].Version++
 	}
+	lc.mu.Unlock()
 }
 
 func respHeaderPopulate(respHeader *server.ResponseHeader) *server.ResponseHeader {
@@ -224,7 +227,7 @@ func (lc *leaseCache) returnChannel(key string) (*leaseInfo, chan struct{}) {
 func (lc *leaseCache) getCachedCopy(ctx context.Context, key string, opts ...v3.OpOption) *v3.GetResponse {
 	var resp *v3.GetResponse
 	ops := v3.OpGet(key, opts...)
-	fmt.Println(ops)
+	//fmt.Println(ops)
 	li, wc := lc.returnChannel(key)
 	if li != nil {
 		select {
@@ -238,6 +241,7 @@ func (lc *leaseCache) getCachedCopy(ctx context.Context, key string, opts ...v3.
 	if resp == nil {
 		return nil
 	}
+	lc.mu.Lock()
 	var keyCopy, valCopy []byte
 	var kvs []*mvccpb.KeyValue
 	flag := true
@@ -274,6 +278,7 @@ func (lc *leaseCache) getCachedCopy(ctx context.Context, key string, opts ...v3.
 		More:   resp.More,
 		Count:  resp.Count,
 	}
+	lc.mu.Unlock()
 	return copyResp
 }
 
@@ -282,6 +287,9 @@ func (lkv *leasingKV) appendMap(getresp *v3.GetResponse, key string) {
 	waitc := make(chan struct{})
 	close(waitc)
 	lkv.leases.entries[key] = &leaseInfo{waitc: waitc, response: getresp, revision: getresp.Header.Revision}
+	if lkv.maxRev < getresp.Header.Revision {
+		lkv.header = getresp.Header
+	}
 	lkv.leases.mu.Unlock()
 }
 
@@ -300,10 +308,10 @@ func (lc *leaseCache) cacheOps(key string, opts ...v3.OpOption) bool {
 	ops := v3.OpGet(key, opts...)
 	count := 0
 	cmps := make([]bool, 0)
-
+	fmt.Println("rangebytes", len(ops.RangeBytes()))
 	if len(opts) > 0 {
 		cmps = append(cmps, ops.IsKeysOnly(), ops.IsCountOnly(), ops.IsMaxModRev() > 0, ops.IsMinModRev() > 0, ops.IsSort(), ops.IsMinCreateRev() > 0,
-			ops.IsMaxCreateRev() > 0, ops.IsLimit() >= 0, (ops.IsSerializable() && lc.inCache(key) != nil))
+			ops.IsMaxCreateRev() > 0, ops.IsLimit() > 0, (ops.IsSerializable() && lc.inCache(key) != nil))
 		for i := range cmps {
 			if cmps[i] == true {
 				count++
@@ -537,6 +545,7 @@ func (txn *txnLeasing) applyCmps() []bool {
 		nicResp, _ := txn.lkv.cl.Txn((txn.lkv.cl.Ctx())).If(notInCacheArray...).Then().Commit()
 		boolArray = append(boolArray, nicResp.Succeeded)
 	}
+	fmt.Println(boolArray)
 	return boolArray
 }
 
@@ -573,17 +582,18 @@ func (txn *txnLeasing) revokeLease(key string) bool {
 }
 
 func (txn *txnLeasing) boolCmps() bool {
-	if len(txn.applyCmps()) > 1 {
-		for i := range txn.applyCmps() {
-			if txn.applyCmps()[i] == false {
+	boolArray := txn.applyCmps()
+	if len(boolArray) == 0 {
+		return true
+	}
+	if len(boolArray) > 1 {
+		for i := range boolArray {
+			if boolArray[i] == false {
 				return false
 			}
 		}
 	}
-	if len(txn.applyCmps()) == 0 {
-		return true
-	}
-	return txn.applyCmps()[0]
+	return boolArray[0]
 }
 
 func (txn *txnLeasing) populateOpArray(opArray []v3.Op) ([]*server.ResponseOp, []v3.Op, []int, []v3.Cmp, []v3.Op) {
@@ -619,14 +629,16 @@ func (txn *txnLeasing) populateOpArray(opArray []v3.Op) ([]*server.ResponseOp, [
 	return responseArray, thenOps, pos, ifCmps, elseOps
 }
 
-func allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
+func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
+	lkv.leases.mu.Lock()
 	resp := (*v3.GetResponse)(responseArray[0].GetResponseRange())
 	respHeader := &server.ResponseHeader{
 		ClusterId: resp.Header.ClusterId,
-		Revision:  returnRev(responseArray),
+		Revision:  lkv.header.Revision,
 		MemberId:  resp.Header.MemberId,
 		RaftTerm:  resp.Header.RaftTerm,
 	}
+	lkv.leases.mu.Unlock()
 	return &v3.TxnResponse{
 		Header:    respHeader,
 		Succeeded: boolvar,
@@ -663,8 +675,8 @@ func (txn *txnLeasing) recomputeCS() []v3.Cmp {
 }
 
 func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
-	var opArray []v3.Op
-	if boolvar {
+	opArray := make([]v3.Op, 0)
+	if boolvar && len(txn.opst) != 0 {
 		opArray = append(opArray, txn.opst...)
 	}
 	if !boolvar && len(txn.opse) != 0 {
@@ -678,19 +690,19 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	respHeader := &server.ResponseHeader{}
 	var i int
 	boolvar := txn.boolCmps()
-	if !boolvar && len(txn.opse) == 0 {
+	opArray := txn.defOpArray(boolvar)
+	if len(opArray) == 0 {
+		txn.lkv.leases.mu.Lock()
 		txnResp = &v3.TxnResponse{
+			Header:    txn.lkv.header,
 			Succeeded: boolvar,
 		}
+		txn.lkv.leases.mu.Unlock()
 		return txnResp, nil
 	}
-	opArray := txn.defOpArray(boolvar)
 	responseArray, thenOps, pos, ifCmps, elseOps := txn.populateOpArray(opArray)
-	if len(opArray) == 0 {
-		return txn.lkv.cl.Txn(txn.lkv.cl.Ctx()).If().Then().Commit()
-	}
-	if len(thenOps) == 0 {
-		return allInCache(responseArray, boolvar)
+	if len(thenOps) == 0 && len(elseOps) == 0 {
+		return txn.lkv.allInCache(responseArray, boolvar)
 	}
 	flag := true
 	allCmps := make([]v3.Cmp, 0)
