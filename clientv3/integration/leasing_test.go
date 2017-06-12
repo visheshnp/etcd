@@ -39,7 +39,7 @@ func TestLeasingPutGet1(t *testing.T) {
 	//c3 := clus.Client(2)
 	lKV1, err := leasing.NewleasingKV(c1, "foo/")
 	lKV2, err := leasing.NewleasingKV(c2, "foo/")
-	//lKV3, err := leasing.NewleasingKV(c3, "foo/")
+	lKV3, err := leasing.NewleasingKV(clus.Client(2), "foo/")
 
 	resp1, err := lKV1.Get(context.TODO(), "abc")
 	if err != nil {
@@ -565,7 +565,7 @@ func TestLeasingOwnerPutResponse(t *testing.T) {
 	}
 }
 
-func TestLeasingTxnOwnerGet2(t *testing.T) {
+func TestLeasingTxnOwnerGet(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -574,35 +574,64 @@ func TestLeasingTxnOwnerGet2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clus.Client(0).Put(context.TODO(), "k", "abc"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := clus.Client(0).Put(context.TODO(), "k2", "123"); err != nil {
-		t.Fatal(err)
-	}
 
-	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
-		t.Fatal(err)
+	keyCount := rand.Intn(10) + 1
+	var ops []clientv3.Op
+	presps := make([]*clientv3.PutResponse, keyCount)
+	for i := range presps {
+		k := fmt.Sprintf("k-%d", i)
+		presp, err := clus.Client(0).Put(context.TODO(), k, k+k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		presps[i] = presp
+
+		if _, err = lkv.Get(context.TODO(), k); err != nil {
+			t.Fatal(err)
+		}
+		ops = append(ops, clientv3.OpGet(k))
 	}
-	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
-		t.Fatal(err)
-	}
+	ops = ops[:rand.Intn(len(ops))]
 
 	// served through cache
 	clus.Members[0].Stop(t)
 
-	tresp, terr := lkv.Txn(context.TODO()).Then(clientv3.OpGet("k"), clientv3.OpGet("k2")).Commit()
+	var thenOps, elseOps []clientv3.Op
+	cmps, useThen := randCmps("k-", presps)
+	if useThen {
+		thenOps = ops
+		elseOps = []clientv3.Op{clientv3.OpPut("k", "1")}
+	} else {
+		thenOps = []clientv3.Op{clientv3.OpPut("k", "1")}
+		elseOps = ops
+	}
+
+	tresp, terr := lkv.Txn(context.TODO()).
+		If(cmps...).
+		Then(thenOps...).
+		Else(elseOps...).Commit()
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	if len(tresp.Responses) != 2 {
-		t.Fatalf("expected 2 responses, got %d", len(tresp.Responses))
+	if tresp.Succeeded != useThen {
+		t.Fatalf("expected succeeded=%v, got tresp=%+v", useThen, tresp)
 	}
-	if rr := tresp.Responses[0].GetResponseRange(); string(rr.Kvs[0].Value) != "abc" {
-		t.Errorf(`expected value "abc", got %q`, string(rr.Kvs[0].Value))
+	if len(tresp.Responses) != len(ops) {
+		t.Fatalf("expected %d responses, got %d", len(ops), len(tresp.Responses))
 	}
-	if rr := tresp.Responses[1].GetResponseRange(); string(rr.Kvs[0].Value) != "123" {
-		t.Errorf(`expected value "123", got %q`, string(rr.Kvs[0].Value))
+	wrev := presps[len(presps)-1].Header.Revision
+	if tresp.Header.Revision < wrev {
+		t.Fatalf("expected header revision >= %d, got %d", wrev, tresp.Header.Revision)
+	}
+	for i := range ops {
+		k := fmt.Sprintf("k-%d", i)
+		rr := tresp.Responses[i].GetResponseRange()
+		if rr == nil {
+			t.Errorf("expected get response, got %+v", tresp.Responses[i])
+		}
+		if string(rr.Kvs[0].Key) != k || string(rr.Kvs[0].Value) != k+k {
+			t.Errorf(`expected key for %q, got %+v`, k, rr.Kvs)
+		}
 	}
 }
 
@@ -816,7 +845,7 @@ func TestLeasingTxnRandIfThenOrElse(t *testing.T) {
 	go getRandom(lkv2)
 
 	// random list of comparisons, all true
-	cmps := randCmps("k-", dat)
+	cmps, useThen := randCmps("k-", dat)
 	// random list of puts/gets; unique keys
 	ops := []clientv3.Op{}
 	usedIdx := make(map[int]struct{})
@@ -836,7 +865,6 @@ func TestLeasingTxnRandIfThenOrElse(t *testing.T) {
 		}
 	}
 	// random lengths
-	cmps = cmps[:rand.Intn(len(cmps))]
 	ops = ops[:rand.Intn(len(ops))]
 
 	// wait for some gets to populate the leasing caches before committing
@@ -846,13 +874,10 @@ func TestLeasingTxnRandIfThenOrElse(t *testing.T) {
 
 	// randomly choose between then and else blocks
 	var thenOps, elseOps []clientv3.Op
-	useThen := rand.Intn(2) == 0
 	if useThen {
 		thenOps = ops
 	} else {
 		// force failure
-		cmp := clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", rand.Intn(keyCount))), "=", 0)
-		cmps = append(cmps, cmp)
 		elseOps = ops
 	}
 
@@ -1200,7 +1225,7 @@ func TestLeasingReconnectNonOwnerGet(t *testing.T) {
 	}
 }
 
-func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp) {
+func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, then bool) {
 	for i := 0; i < len(dat); i++ {
 		idx := rand.Intn(len(dat))
 		k := fmt.Sprintf("%s%d", pfx, idx)
@@ -1219,5 +1244,11 @@ func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp) {
 		}
 		cmps = append(cmps, cmp)
 	}
-	return cmps
+	cmps = cmps[:rand.Intn(len(dat))]
+	if rand.Intn(2) == 0 {
+		return cmps, true
+	}
+	i := rand.Intn(len(dat))
+	cmps = append(cmps, clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", i)), "=", 0))
+	return cmps, false
 }
