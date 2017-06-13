@@ -1177,6 +1177,43 @@ func TestLeasingReconnectOwnerPut(t *testing.T) {
 	}
 }
 
+// TestLeasingReconnectTxn checks that txns are resilient to disconnects.
+func TestLeasingReconnectTxn(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	donec := make(chan struct{})
+	go func() {
+		defer close(donec)
+		clus.Members[0].DropConnections()
+		go func() {
+			defer close(donec)
+			for i := 0; i < 10; i++ {
+				clus.Members[0].DropConnections()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}()
+
+	_, lerr := lkv.Txn(context.TODO()).
+		If(clientv3.Compare(clientv3.Version("k"), "=", 0)).
+		Then(clientv3.OpGet("k")).
+		Commit()
+	<-donec
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+}
+
 // TestLeasingReconnectNonOwnerGet checks a get error on an owner will
 // not cause inconsistency between the server and the client.
 func TestLeasingReconnectNonOwnerGet(t *testing.T) {
