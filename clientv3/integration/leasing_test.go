@@ -733,6 +733,41 @@ func TestLeasingTxnOwnerIf(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnCancel(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	lkv1, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lkv2, err := leasing.NewleasingKV(clus.Client(1), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// acquire lease but disconnect so no revoke in time
+	if _, err := lkv1.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	clus.Members[0].Stop(t)
+
+	// wait for leader election, if any
+	if _, err := clus.Client(1).Get(context.TODO(), "abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := lkv2.Txn(ctx).Then(clientv3.OpPut("k", "v")).Commit(); err != context.Canceled {
+		t.Fatal("expected %v, got %v", context.Canceled, err)
+	}
+}
+
 func TestLeasingTxnNonOwnerPut(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
@@ -1264,6 +1299,28 @@ func TestLeasingReconnectNonOwnerGet(t *testing.T) {
 		}
 		if !reflect.DeepEqual(lresp.Kvs, cresp.Kvs) {
 			t.Fatalf("expected %+v, got %+v", cresp, lresp)
+		}
+	}
+}
+
+func TestLeasingDo(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ops := []clientv3.Op{
+		clientv3.OpGet("a"),
+		clientv3.OpPut("b", "v"),
+		clientv3.OpDelete("a"),
+	}
+	for i, op := range ops {
+		if _, err := lkv.Do(context.TODO(), op); err != nil {
+			t.Errorf("#%d: failed (%v)", i, err)
 		}
 	}
 }
