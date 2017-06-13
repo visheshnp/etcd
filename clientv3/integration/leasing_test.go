@@ -1116,7 +1116,7 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 	go func() {
 		defer close(pdonec)
 		if _, err := lkv2.Put(cctx, "k", "v"); err != nil {
-			t.Fatal(err)
+			t.Log(err)
 		}
 	}()
 	select {
