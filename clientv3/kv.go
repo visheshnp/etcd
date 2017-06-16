@@ -160,3 +160,12 @@ func (kv *kv) do(ctx context.Context, op Op) (OpResponse, error) {
 	}
 	return OpResponse{}, err
 }
+
+//OpResponse returns get field from OpResponse struct.
+func (gr *GetResponse) OpResponse() OpResponse { return OpResponse{get: gr} }
+
+//OpResponse returns put field from OpResponse struct.
+func (pr *PutResponse) OpResponse() OpResponse { return OpResponse{put: pr} }
+
+//OpResponse returns del field from OpResponse struct.
+func (dr *DeleteResponse) OpResponse() OpResponse { return OpResponse{del: dr} }
