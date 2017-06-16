@@ -352,11 +352,10 @@ func TestLeasingGetWithOpts(t *testing.T) {
 	}
 
 	getOpts := []clientv3.OpOption{}
-	randNumOpts := rand.Intn(len(opts)) + 1
 	for i := 0; i < len(opts); i++ {
-		getOpts = append(getOpts, opts[len(opts)%randNumOpts])
+		getOpts = append(getOpts, opts[rand.Intn(len(opts))])
 	}
-	getOpts = getOpts[:randNumOpts]
+	getOpts = getOpts[:rand.Intn(len(opts))]
 	if _, err := lkv.Get(context.TODO(), "k", getOpts...); err != nil {
 		t.Fatal(err)
 	}
