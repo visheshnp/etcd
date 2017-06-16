@@ -1186,15 +1186,19 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 	}
 }
 
-// TestLeasingReconnectOwnerPut checks a put error on an owner will
+// TestLeasingReconnectOwnerConsistency checks a write error on an owner will
 // not cause inconsistency between the server and the client.
-func TestLeasingReconnectOwnerPut(t *testing.T) {
+func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 
 	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := lkv.Put(context.TODO(), "k", "x"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
@@ -1212,7 +1216,28 @@ func TestLeasingReconnectOwnerPut(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		}()
-		_, err = lkv.Put(context.TODO(), "k", v)
+		switch rand.Intn(6) {
+		case 0:
+			_, err = lkv.Put(context.TODO(), "k", v)
+		case 1:
+			_, err = lkv.Delete(context.TODO(), "k")
+		case 2:
+			txn := lkv.Txn(context.TODO()).Then(
+				clientv3.OpGet("k"),
+				clientv3.OpDelete("k"),
+			)
+			_, err = txn.Commit()
+		case 3:
+			txn := lkv.Txn(context.TODO()).Then(
+				clientv3.OpGet("k"),
+				clientv3.OpPut("k", v),
+			)
+			_, err = txn.Commit()
+		case 4:
+			_, err = lkv.Do(context.TODO(), clientv3.OpPut("k", v))
+		case 5:
+			_, err = lkv.Do(context.TODO(), clientv3.OpDelete("k"))
+		}
 		<-donec
 		if err != nil {
 			break
