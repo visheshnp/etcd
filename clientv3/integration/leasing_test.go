@@ -352,10 +352,11 @@ func TestLeasingGetWithOpts(t *testing.T) {
 	}
 
 	getOpts := []clientv3.OpOption{}
+	randNumOpts := rand.Intn(len(opts)) + 1
 	for i := 0; i < len(opts); i++ {
-		getOpts = append(getOpts, opts[len(opts)%rand.Intn(len(opts))])
+		getOpts = append(getOpts, opts[len(opts)%randNumOpts])
 	}
-	getOpts = getOpts[:rand.Intn(len(opts))]
+	getOpts = getOpts[:randNumOpts]
 	if _, err := lkv.Get(context.TODO(), "k", getOpts...); err != nil {
 		t.Fatal(err)
 	}
@@ -1250,13 +1251,10 @@ func TestLeasingReconnectTxn(t *testing.T) {
 	go func() {
 		defer close(donec)
 		clus.Members[0].DropConnections()
-		go func() {
-			defer close(donec)
-			for i := 0; i < 10; i++ {
-				clus.Members[0].DropConnections()
-				time.Sleep(time.Millisecond)
-			}
-		}()
+		for i := 0; i < 10; i++ {
+			clus.Members[0].DropConnections()
+			time.Sleep(time.Millisecond)
+		}
 	}()
 
 	_, lerr := lkv.Txn(context.TODO()).
