@@ -192,11 +192,22 @@ func TestV3TxnTooManyOps(t *testing.T) {
 				},
 			})
 	}
+	addTxnOps := func(txn *pb.TxnRequest) {
+		newTxn := &pb.TxnRequest{}
+		addSuccessOps(newTxn)
+		txn.Success = append(txn.Success,
+			&pb.RequestOp{Request: &pb.RequestOp_RequestTxn{
+				RequestTxn: newTxn,
+			},
+			},
+		)
+	}
 
 	tests := []func(txn *pb.TxnRequest){
 		addCompareOps,
 		addSuccessOps,
 		addFailureOps,
+		addTxnOps,
 	}
 
 	for i, tt := range tests {
@@ -236,6 +247,27 @@ func TestV3TxnDuplicateKeys(t *testing.T) {
 		},
 	},
 	}
+	txnDelReq := &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{
+		RequestTxn: &pb.TxnRequest{Success: []*pb.RequestOp{delInRangeReq}},
+	},
+	}
+	txnDelReqTwoSide := &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{
+		RequestTxn: &pb.TxnRequest{
+			Success: []*pb.RequestOp{delInRangeReq},
+			Failure: []*pb.RequestOp{delInRangeReq}},
+	},
+	}
+
+	txnPutReq := &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{
+		RequestTxn: &pb.TxnRequest{Success: []*pb.RequestOp{putreq}},
+	},
+	}
+	txnPutReqTwoSide := &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{
+		RequestTxn: &pb.TxnRequest{
+			Success: []*pb.RequestOp{putreq},
+			Failure: []*pb.RequestOp{putreq}},
+	},
+	}
 
 	kvc := toGRPC(clus.RandClient()).KV
 	tests := []struct {
@@ -257,6 +289,36 @@ func TestV3TxnDuplicateKeys(t *testing.T) {
 			txnSuccess: []*pb.RequestOp{putreq, delInRangeReq},
 
 			werr: rpctypes.ErrGRPCDuplicateKey,
+		},
+		// Then(Put(a), Then(Del(a)))
+		{
+			txnSuccess: []*pb.RequestOp{putreq, txnDelReq},
+
+			werr: rpctypes.ErrGRPCDuplicateKey,
+		},
+		// Then(Del(a), Then(Put(a)))
+		{
+			txnSuccess: []*pb.RequestOp{delInRangeReq, txnPutReq},
+
+			werr: rpctypes.ErrGRPCDuplicateKey,
+		},
+		// Then((Then(Put(a)), Else(Put(a))), (Then(Put(a)), Else(Put(a)))
+		{
+			txnSuccess: []*pb.RequestOp{txnPutReqTwoSide, txnPutReqTwoSide},
+
+			werr: rpctypes.ErrGRPCDuplicateKey,
+		},
+		// Then(Del(x), (Then(Put(a)), Else(Put(a))))
+		{
+			txnSuccess: []*pb.RequestOp{delOutOfRangeReq, txnPutReqTwoSide},
+
+			werr: nil,
+		},
+		// Then(Then(Del(a)), (Then(Del(a)), Else(Del(a))))
+		{
+			txnSuccess: []*pb.RequestOp{txnDelReq, txnDelReqTwoSide},
+
+			werr: nil,
 		},
 		{
 			txnSuccess: []*pb.RequestOp{delKeyReq, delInRangeReq, delKeyReq, delInRangeReq},

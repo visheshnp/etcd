@@ -106,27 +106,35 @@ func TestTxnReadRetry(t *testing.T) {
 	defer clus.Terminate(t)
 
 	kv := clus.Client(0)
-	clus.Members[0].Stop(t)
-	<-clus.Members[0].StopNotify()
 
-	donec := make(chan struct{})
-	go func() {
-		ctx := context.TODO()
-		_, err := kv.Txn(ctx).Then(clientv3.OpGet("foo")).Commit()
-		if err != nil {
-			t.Fatalf("expected response, got error %v", err)
+	thenOps := [][]clientv3.Op{
+		{clientv3.OpGet("foo")},
+		{clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpGet("foo")}, nil)},
+		{clientv3.OpTxn(nil, nil, nil)},
+		{},
+	}
+	for i := range thenOps {
+		clus.Members[0].Stop(t)
+		<-clus.Members[0].StopNotify()
+
+		donec := make(chan struct{})
+		go func() {
+			_, err := kv.Txn(context.TODO()).Then(thenOps[i]...).Commit()
+			if err != nil {
+				t.Fatalf("expected response, got error %v", err)
+			}
+			donec <- struct{}{}
+		}()
+		// wait for txn to fail on disconnect
+		time.Sleep(100 * time.Millisecond)
+
+		// restart node; client should resume
+		clus.Members[0].Restart(t)
+		select {
+		case <-donec:
+		case <-time.After(2 * clus.Members[1].ServerConfig.ReqTimeout()):
+			t.Fatalf("waited too long")
 		}
-		donec <- struct{}{}
-	}()
-	// wait for txn to fail on disconnect
-	time.Sleep(100 * time.Millisecond)
-
-	// restart node; client should resume
-	clus.Members[0].Restart(t)
-	select {
-	case <-donec:
-	case <-time.After(2 * clus.Members[1].ServerConfig.ReqTimeout()):
-		t.Fatalf("waited too long")
 	}
 }
 
