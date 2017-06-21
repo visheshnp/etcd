@@ -501,11 +501,17 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 				return nil, err
 			}
 			if !resp.Succeeded {
+				mapResp := make(map[string]bool)
+				for i = 0; i < len(elseOps); i++ {
+					key := string(elseOps[i].KeyBytes())
+					if len((*v3.GetResponse)(resp.Responses[i].GetResponseRange()).Kvs) != 0 {
+						mapResp[(strings.TrimPrefix(key, txn.lkv.pfx))] = true
+					}
+				}
 				for i = 0; i < len(allOps); i++ {
 					key := string(allOps[i].KeyBytes())
-					response := (*v3.GetResponse)(resp.Responses[i].GetResponseRange())
 					if li := txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)); li == nil {
-						if len(response.Kvs) != 0 && (allOps[i].IsPut() || allOps[i].IsDelete()) {
+						if mapResp[key] && (allOps[i].IsPut() || allOps[i].IsDelete()) {
 							err := txn.revokeLease(key)
 							if err != nil {
 								return nil, err
