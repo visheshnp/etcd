@@ -189,7 +189,7 @@ func (kv *kvPrefix) prefixCmps(cs []clientv3.Cmp) []clientv3.Cmp {
 	newCmps := make([]clientv3.Cmp, len(cs))
 	for i := range cs {
 		newCmps[i] = cs[i]
-		pfxKey, endKey := txn.kv.prefixInterval(cs[i].KeyBytes(), cs[i].RangeEnd)
+		pfxKey, endKey := kv.prefixInterval(cs[i].KeyBytes(), cs[i].RangeEnd)
 		newCmps[i].WithKeyBytes(pfxKey)
 		if len(cs[i].RangeEnd) != 0 {
 			newCmps[i].RangeEnd = endKey
