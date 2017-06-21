@@ -160,6 +160,7 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 }
 
 func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
+	isPresent := make(map[string]bool)
 	elseOps, cmps := make([]v3.Op, 0), make([]v3.Cmp, 0)
 	var rev int64
 	for i := range opArray {
@@ -172,11 +173,13 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
 			rev = 0
 		}
 		if opArray[i].IsGet() {
-			elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 			continue
 		}
-		cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
-		elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
+		if !isPresent[txn.lkv.pfx+key] {
+			cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
+			elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
+			isPresent[txn.lkv.pfx+key] = true
+		}
 	}
 	return elseOps, cmps
 }
