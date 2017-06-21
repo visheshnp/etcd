@@ -18,8 +18,8 @@ func compareInt64(a, b int64) int {
 	}
 }
 
-func (txn *txnLeasing) applyCmps() ([]bool, error) {
-	boolArray, notInCacheArray := make([]bool, 0), make([]v3.Cmp, 0)
+func (txn *txnLeasing) allCmpsfromCache() (bool, bool) {
+	serverTxnBool, cacheBool, cacheCount := false, true, 0
 	if txn.cs != nil {
 		for itr := range txn.cs {
 			if li := txn.lkv.leases.inCache(string(txn.cs[itr].Key)); li != nil {
@@ -72,22 +72,17 @@ func (txn *txnLeasing) applyCmps() ([]bool, error) {
 						break
 					}
 				}
-				boolArray = append(boolArray, resultbool)
+				if resultbool == false {
+					cacheBool = resultbool
+				}
+				cacheCount++
 			}
-			if txn.lkv.leases.inCache(string(txn.cs[itr].Key)) == nil {
-				notInCacheArray = append(notInCacheArray, txn.cs[itr])
-			}
 		}
-		if len(txn.cs) == len(boolArray) {
-			return boolArray, nil
+		if len(txn.cs) != cacheCount {
+			serverTxnBool = true
 		}
-		nicResp, err := txn.lkv.cl.Txn(txn.ctx).If(notInCacheArray...).Then().Commit()
-		if err != nil {
-			return nil, err
-		}
-		boolArray = append(boolArray, nicResp.Succeeded)
 	}
-	return boolArray, nil
+	return cacheBool, serverTxnBool
 }
 
 func returnRev(respArray []*server.ResponseOp) int64 {
@@ -126,27 +121,46 @@ func (txn *txnLeasing) revokeLease(key string) error {
 	return nil
 }
 
-func (txn *txnLeasing) boolCmps() (bool, error) {
-	boolArray, err := txn.applyCmps()
-	if err != nil && boolArray == nil {
-		return false, err
-	}
-	if len(boolArray) == 0 {
-		return true, nil
-	}
-	if len(boolArray) > 1 {
-		for i := range boolArray {
-			if boolArray[i] == false {
-				return false, nil
+func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResponse, error) {
+	var txnResp *v3.TxnResponse
+	noOp := len(opArray) == 0
+	if noOp {
+		txn.lkv.leases.mu.Lock()
+		if txn.lkv.header != nil {
+			txnResp = &v3.TxnResponse{
+				Header:    txn.lkv.header,
+				Succeeded: cacheBool,
 			}
+			txn.lkv.leases.mu.Unlock()
+			return noOp, txnResp, nil
 		}
+		resp, err := txn.lkv.cl.Txn(txn.ctx).If().Then().Commit()
+		if err != nil {
+			return noOp, nil, err
+		}
+		return noOp, resp, err
 	}
-	return boolArray[0], nil
+	return noOp, nil, nil
 }
 
-func (txn *txnLeasing) populateOpArray(opArray []v3.Op) ([]*server.ResponseOp, []v3.Op, []int, []v3.Cmp, []v3.Op) {
-	elseOps, thenOps, pos := make([]v3.Op, 0), make([]v3.Op, 0), make([]int, 0)
-	respOp, ifCmps, responseArray := &server.ResponseOp{}, make([]v3.Cmp, 0), make([]*server.ResponseOp, len(opArray))
+func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool) {
+	respOp, responseArray, opCount := &server.ResponseOp{}, make([]*server.ResponseOp, len(opArray)), 0
+	for i := range opArray {
+		key := string(opArray[i].KeyBytes())
+		li := txn.lkv.leases.inCache(key)
+		if li != nil && opArray[i].IsGet() {
+			respOp = &server.ResponseOp{
+				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key))},
+			}
+			responseArray[i] = respOp
+			opCount++
+		}
+	}
+	return responseArray, opCount == len(opArray)
+}
+
+func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
+	elseOps, cmps := make([]v3.Op, 0), make([]v3.Cmp, 0)
 	var rev int64
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
@@ -154,27 +168,17 @@ func (txn *txnLeasing) populateOpArray(opArray []v3.Op) ([]*server.ResponseOp, [
 		if li != nil {
 			rev = li.revision
 		}
-		if li != nil && opArray[i].IsGet() {
-			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key))},
-			}
-			responseArray[i] = respOp
+		if li == nil {
+			rev = 0
 		}
-		if opArray[i].IsPut() || opArray[i].IsDelete() {
-			ifCmps = append(ifCmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
-			thenOps = append(thenOps, opArray[i])
-			pos = append(pos, i)
+		if opArray[i].IsGet() {
 			elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
-			responseArray[i] = nil
+			continue
 		}
-		if li == nil && opArray[i].IsGet() {
-			thenOps = append(thenOps, opArray[i])
-			elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
-			pos = append(pos, i)
-			responseArray[i] = nil
-		}
+		cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
+		elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 	}
-	return responseArray, thenOps, pos, ifCmps, elseOps
+	return elseOps, cmps
 }
 
 func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
@@ -194,34 +198,6 @@ func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar boo
 	}, nil
 }
 
-func (txn *txnLeasing) computeCS() []v3.Cmp {
-	compCS := make([]v3.Cmp, 0)
-	if txn.cs != nil {
-		for itr := range txn.cs {
-			if li := txn.lkv.leases.inCache(string(txn.cs[itr].Key)); li != nil {
-				compCS = append(compCS, txn.cs[itr])
-			}
-		}
-	}
-	txn.cs = nil
-	for i := range compCS {
-		txn.cs = append(txn.cs, compCS[i])
-	}
-	return compCS
-}
-
-func (txn *txnLeasing) recomputeCS() []v3.Cmp {
-	recompCS := make([]v3.Cmp, 0)
-	if txn.cs != nil {
-		for itr := range txn.cs {
-			if li := txn.lkv.leases.inCache(string(txn.cs[itr].Key)); li == nil {
-				recompCS = append(recompCS, txn.cs[itr])
-			}
-		}
-	}
-	return recompCS
-}
-
 func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
 	opArray := make([]v3.Op, 0)
 	if boolvar && len(txn.opst) != 0 {
@@ -231,4 +207,25 @@ func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
 		opArray = append(opArray, txn.opse...)
 	}
 	return opArray
+}
+
+func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
+	var txnResp *v3.TxnResponse
+	respHeader := &server.ResponseHeader{}
+	responseArray := make([]*server.ResponseOp, 0)
+	for i := range resp.Responses[0].GetResponseTxn().Responses {
+		responseArray = append(responseArray, resp.Responses[0].GetResponseTxn().Responses[i])
+	}
+	respHeader.Revision = returnRev(responseArray)
+	respHeader = &server.ResponseHeader{
+		ClusterId: resp.Header.ClusterId,
+		MemberId:  resp.Header.MemberId,
+		RaftTerm:  resp.Header.RaftTerm,
+	}
+	txnResp = &v3.TxnResponse{
+		Header:    resp.Header,
+		Succeeded: resp.Responses[0].GetResponseTxn().Succeeded,
+		Responses: responseArray,
+	}
+	return txnResp
 }
