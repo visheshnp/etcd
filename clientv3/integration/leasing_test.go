@@ -1367,6 +1367,45 @@ func TestLeasingDo(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnOwnerPutBranch(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
+		t.Fatal(err)
+	}
+
+	txn := lkv.Txn(context.TODO()).If(clientv3.Compare(clientv3.Version("k"), "=", 0)).
+		Then(clientv3.OpPut("k", "x")).
+		Else(clientv3.OpPut("k2", "y"))
+	if _, err := txn.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := lkv.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := string(resp.Kvs[0].Value); v != "v" {
+		t.Fatalf("expected %q, got %q", "v", v)
+	}
+}
+
 func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, then bool) {
 	for i := 0; i < len(dat); i++ {
 		idx := rand.Intn(len(dat))
