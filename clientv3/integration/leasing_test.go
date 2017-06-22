@@ -1210,6 +1210,9 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 	if _, err := lkv.Put(context.TODO(), "k", "x"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := lkv.Put(context.TODO(), "kk", "y"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -1225,7 +1228,7 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		}()
-		switch rand.Intn(6) {
+		switch rand.Intn(7) {
 		case 0:
 			_, err = lkv.Put(context.TODO(), "k", v)
 		case 1:
@@ -1246,6 +1249,8 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 			_, err = lkv.Do(context.TODO(), clientv3.OpPut("k", v))
 		case 5:
 			_, err = lkv.Do(context.TODO(), clientv3.OpDelete("k"))
+		case 6:
+			_, err = lkv.Delete(context.TODO(), "k", clientv3.WithPrefix())
 		}
 		<-donec
 		if err != nil {
