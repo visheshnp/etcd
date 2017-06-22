@@ -1030,7 +1030,15 @@ func TestLeasingNonOwnerPutError(t *testing.T) {
 	}
 }
 
-func TestLeasingOwnerDeleteRange(t *testing.T) {
+func TestLeasingOwnerDeletePrefix(t *testing.T) {
+	testLeasingOwnerDelete(t, clientv3.OpDelete("key/", clientv3.WithPrefix()))
+}
+
+func TestLeasingOwnerDeleteFrom(t *testing.T) {
+	testLeasingOwnerDelete(t, clientv3.OpDelete("kd", clientv3.WithFromKey()))
+}
+
+func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -1050,10 +1058,11 @@ func TestLeasingOwnerDeleteRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	delResp, delErr := lkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	opResp, delErr := lkv.Do(context.TODO(), del)
 	if delErr != nil {
 		t.Fatal(delErr)
 	}
+	delResp := opResp.Del()
 
 	// confirm keys are invalidated from cache and deleted on etcd
 	for i := 0; i < 8; i++ {
