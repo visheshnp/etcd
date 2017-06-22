@@ -1356,14 +1356,35 @@ func TestLeasingDo(t *testing.T) {
 	}
 
 	ops := []clientv3.Op{
+		clientv3.OpTxn(nil, nil, nil),
 		clientv3.OpGet("a"),
-		clientv3.OpPut("b", "v"),
-		clientv3.OpDelete("a"),
+		clientv3.OpPut("a/abc", "v"),
+		clientv3.OpDelete("a", clientv3.WithPrefix()),
+		clientv3.OpTxn(nil, nil, nil),
 	}
 	for i, op := range ops {
-		if _, err := lkv.Do(context.TODO(), op); err != nil {
+		resp, err := lkv.Do(context.TODO(), op)
+		if err != nil {
 			t.Errorf("#%d: failed (%v)", i, err)
 		}
+		switch {
+		case op.IsGet() && resp.Get() == nil:
+			t.Errorf("#%d: get but nil get response", i)
+		case op.IsPut() && resp.Put() == nil:
+			t.Errorf("#%d: put op but nil get response", i)
+		case op.IsDelete() && resp.Del() == nil:
+			t.Errorf("#%d: delete op but nil delete response", i)
+		case op.IsTxn() && resp.Txn() == nil:
+			t.Errorf("#%d: txn op but nil txn response", i)
+		}
+	}
+
+	gresp, err := clus.Client(0).Get(context.TODO(), "a", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gresp.Kvs) != 0 {
+		t.Fatalf("expected no keys, got %+v", gresp.Kvs)
 	}
 }
 
