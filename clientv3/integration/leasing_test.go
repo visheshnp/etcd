@@ -1030,7 +1030,15 @@ func TestLeasingNonOwnerPutError(t *testing.T) {
 	}
 }
 
-func TestLeasingOwnerDeleteRange(t *testing.T) {
+func TestLeasingOwnerDeletePrefix(t *testing.T) {
+	testLeasingOwnerDelete(t, clientv3.OpDelete("key/", clientv3.WithPrefix()))
+}
+
+func TestLeasingOwnerDeleteFrom(t *testing.T) {
+	testLeasingOwnerDelete(t, clientv3.OpDelete("kd", clientv3.WithFromKey()))
+}
+
+func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -1050,10 +1058,11 @@ func TestLeasingOwnerDeleteRange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	delResp, delErr := lkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	opResp, delErr := lkv.Do(context.TODO(), del)
 	if delErr != nil {
 		t.Fatal(delErr)
 	}
+	delResp := opResp.Del()
 
 	// confirm keys are invalidated from cache and deleted on etcd
 	for i := 0; i < 8; i++ {
@@ -1201,6 +1210,9 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 	if _, err := lkv.Put(context.TODO(), "k", "x"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := lkv.Put(context.TODO(), "kk", "y"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -1216,7 +1228,7 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		}()
-		switch rand.Intn(6) {
+		switch rand.Intn(7) {
 		case 0:
 			_, err = lkv.Put(context.TODO(), "k", v)
 		case 1:
@@ -1237,6 +1249,8 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 			_, err = lkv.Do(context.TODO(), clientv3.OpPut("k", v))
 		case 5:
 			_, err = lkv.Do(context.TODO(), clientv3.OpDelete("k"))
+		case 6:
+			_, err = lkv.Delete(context.TODO(), "k", clientv3.WithPrefix())
 		}
 		<-donec
 		if err != nil {
@@ -1356,14 +1370,74 @@ func TestLeasingDo(t *testing.T) {
 	}
 
 	ops := []clientv3.Op{
+		clientv3.OpTxn(nil, nil, nil),
 		clientv3.OpGet("a"),
-		clientv3.OpPut("b", "v"),
-		clientv3.OpDelete("a"),
+		clientv3.OpPut("a/abc", "v"),
+		clientv3.OpDelete("a", clientv3.WithPrefix()),
+		clientv3.OpTxn(nil, nil, nil),
 	}
 	for i, op := range ops {
-		if _, err := lkv.Do(context.TODO(), op); err != nil {
+		resp, err := lkv.Do(context.TODO(), op)
+		if err != nil {
 			t.Errorf("#%d: failed (%v)", i, err)
 		}
+		switch {
+		case op.IsGet() && resp.Get() == nil:
+			t.Errorf("#%d: get but nil get response", i)
+		case op.IsPut() && resp.Put() == nil:
+			t.Errorf("#%d: put op but nil get response", i)
+		case op.IsDelete() && resp.Del() == nil:
+			t.Errorf("#%d: delete op but nil delete response", i)
+		case op.IsTxn() && resp.Txn() == nil:
+			t.Errorf("#%d: txn op but nil txn response", i)
+		}
+	}
+
+	gresp, err := clus.Client(0).Get(context.TODO(), "a", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gresp.Kvs) != 0 {
+		t.Fatalf("expected no keys, got %+v", gresp.Kvs)
+	}
+}
+
+func TestLeasingTxnOwnerPutBranch(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
+		t.Fatal(err)
+	}
+
+	txn := lkv.Txn(context.TODO()).If(clientv3.Compare(clientv3.Version("k"), "=", 0)).
+		Then(clientv3.OpPut("k", "x")).
+		Else(clientv3.OpPut("k2", "y"))
+	if _, err := txn.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := lkv.Get(context.TODO(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := string(resp.Kvs[0].Value); v != "v" {
+		t.Fatalf("expected %q, got %q", "v", v)
 	}
 }
 
