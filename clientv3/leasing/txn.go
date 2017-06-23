@@ -150,7 +150,8 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 		li := txn.lkv.leases.inCache(key)
 		if li != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key))},
+				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key,
+					v3.OpGet(key)))},
 			}
 			responseArray[i] = respOp
 			opCount++
@@ -232,3 +233,58 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 	}
 	return txnResp
 }
+
+func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
+	if txnResp.Succeeded && len(txn.opst) != 0 {
+		for i := range txn.opst {
+			key := string(txn.opst[i].KeyBytes())
+			li := txn.lkv.leases.inCache(key)
+			if li != nil && txn.opst[i].IsPut() {
+				txn.lkv.leases.updateCacheResp(key, string(txn.opst[i].ValueBytes()), txnResp.Header)
+			}
+			if li != nil && txn.opst[i].IsDelete() {
+				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(key))
+			}
+		}
+	}
+	if !txnResp.Succeeded && len(txn.opse) != 0 {
+		for i := range txn.opse {
+			key := string(txn.opse[i].KeyBytes())
+			li := txn.lkv.leases.inCache(key)
+			if li != nil && txn.opse[i].IsPut() {
+				txn.lkv.leases.updateCacheResp(key, string(txn.opse[i].ValueBytes()), txnResp.Header)
+			}
+			if li != nil && txn.opse[i].IsDelete() {
+				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(key))
+			}
+		}
+	}
+}
+
+/*
+func (txn *txnLeasing) gatherAllOps(myOps []v3.Op, allOps []v3.Op) []v3.Op {
+	if len(myOps) == 0 {
+		fmt.Println("here")
+		return allOps
+	}
+
+	fmt.Println("myops", myOps)
+
+	if len(myOps) != 0 {
+		for i := range myOps {
+			if !myOps[i].IsTxn() {
+				allOps = append(allOps, myOps[i])
+				txn.gatherAllOps(myOps, allOps)
+			}
+
+			if myOps[i].IsTxn() {
+				_, thenOps, elseOps := myOps[i].Txn()
+				ops := append(thenOps, elseOps...)
+				txn.gatherAllOps(ops, allOps)
+			}
+		}
+	}
+	fmt.Println("allOps b4 return", allOps)
+	return allOps
+}
+*/
