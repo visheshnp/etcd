@@ -176,3 +176,6 @@ func (pr *PutResponse) OpResponse() OpResponse { return OpResponse{put: pr} }
 
 //OpResponse returns del field from OpResponse struct.
 func (dr *DeleteResponse) OpResponse() OpResponse { return OpResponse{del: dr} }
+
+//OpResponse returns txn field from OpResponse struct.
+func (tr *TxnResponse) OpResponse() OpResponse { return OpResponse{txn: tr} }
