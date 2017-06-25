@@ -2,6 +2,7 @@ package leasing
 
 import (
 	"bytes"
+	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
 	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
@@ -125,13 +126,11 @@ func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResp
 	var txnResp *v3.TxnResponse
 	noOp := len(opArray) == 0
 	if noOp {
-		txn.lkv.leases.mu.Lock()
 		if txn.lkv.header != nil {
 			txnResp = &v3.TxnResponse{
 				Header:    txn.lkv.header,
 				Succeeded: cacheBool,
 			}
-			txn.lkv.leases.mu.Unlock()
 			return noOp, txnResp, nil
 		}
 		resp, err := txn.lkv.cl.Txn(txn.ctx).If().Then().Commit()
@@ -261,30 +260,64 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	}
 }
 
-/*
-func (txn *txnLeasing) gatherAllOps(myOps []v3.Op, allOps []v3.Op) []v3.Op {
+func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
+	allOps := make([]v3.Op, 0)
 	if len(myOps) == 0 {
-		fmt.Println("here")
 		return allOps
 	}
-
-	fmt.Println("myops", myOps)
-
-	if len(myOps) != 0 {
-		for i := range myOps {
-			if !myOps[i].IsTxn() {
-				allOps = append(allOps, myOps[i])
-				txn.gatherAllOps(myOps, allOps)
-			}
-
-			if myOps[i].IsTxn() {
-				_, thenOps, elseOps := myOps[i].Txn()
-				ops := append(thenOps, elseOps...)
-				txn.gatherAllOps(ops, allOps)
-			}
+	for i := range myOps {
+		if !myOps[i].IsTxn() {
+			allOps = append(allOps, myOps[i])
+		}
+		if myOps[i].IsTxn() {
+			_, thenOps, elseOps := myOps[i].Txn()
+			ops := append(thenOps, elseOps...)
+			allOps = append(allOps, txn.gatherAllOps(ops)...)
 		}
 	}
-	fmt.Println("allOps b4 return", allOps)
+	return allOps
+}
+
+/*
+func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
+	allOps := make([]v3.Op, 0)
+	for _, op := range myOps {
+		allOps = append(allOps, txn.gatherAllOpsHelper(op)...)
+	}
+	return allOps
+}
+
+func (txn *txnLeasing) gatherAllOpsHelper(op v3.Op) []v3.Op {
+	if !op.IsTxn() {
+		return []v3.Op{op}
+	}
+	allOps := make([]v3.Op, 0)
+
+	_, thenOps, elseOps := op.Txn()
+	ops := append(thenOps, elseOps...)
+
+	for _, tmpOp := range ops {
+		allOps = append(allOps, txn.gatherAllOpsHelper(tmpOp)...)
+	}
 	return allOps
 }
 */
+
+func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txnOps []v3.Op) error {
+	mapResp := make(map[string]bool)
+	for i := range elseOps {
+		key := string(elseOps[i].KeyBytes())
+		if len((*v3.GetResponse)(resp.Responses[i].GetResponseRange()).Kvs) != 0 {
+			mapResp[(strings.TrimPrefix(key, txn.lkv.pfx))] = true
+		}
+	}
+	for i := range txnOps {
+		key := string(txnOps[i].KeyBytes())
+		if li := txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)); li == nil {
+			if mapResp[key] && (txnOps[i].IsPut() || txnOps[i].IsDelete()) {
+				return txn.revokeLease(key)
+			}
+		}
+	}
+	return nil
+}
