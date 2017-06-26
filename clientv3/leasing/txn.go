@@ -6,6 +6,7 @@ import (
 
 	v3 "github.com/coreos/etcd/clientv3"
 	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
 func compareInt64(a, b int64) int {
@@ -109,6 +110,7 @@ func returnRev(respArray []*server.ResponseOp) int64 {
 }
 
 func (txn *txnLeasing) revokeLease(key string) error {
+	var err error
 	txn1 := txn.lkv.cl.Txn(txn.ctx).If(v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", 0))
 	txn1 = txn1.Then(v3.OpPut(txn.lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
 	revokeResp, err := txn1.Commit()
@@ -117,9 +119,8 @@ func (txn *txnLeasing) revokeLease(key string) error {
 	}
 	if revokeResp.Succeeded {
 		txn.lkv.watchforLKDel(txn.ctx, key, revokeResp.Header.Revision)
-		return nil
 	}
-	return nil
+	return err
 }
 
 func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResponse, error) {
@@ -127,10 +128,12 @@ func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResp
 	noOp := len(opArray) == 0
 	if noOp {
 		if txn.lkv.header != nil {
+			txn.lkv.leases.mu.Lock()
 			txnResp = &v3.TxnResponse{
 				Header:    txn.lkv.header,
 				Succeeded: cacheBool,
 			}
+			txn.lkv.leases.mu.Unlock()
 			return noOp, txnResp, nil
 		}
 		resp, err := txn.lkv.cl.Txn(txn.ctx).If().Then().Commit()
@@ -160,8 +163,7 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 }
 
 func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
-	isPresent := make(map[string]bool)
-	elseOps, cmps := make([]v3.Op, 0), make([]v3.Cmp, 0)
+	isPresent, elseOps, cmps := make(map[string]bool), make([]v3.Op, 0), make([]v3.Cmp, 0)
 	var rev int64
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
@@ -214,8 +216,7 @@ func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
 
 func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 	var txnResp *v3.TxnResponse
-	respHeader := &server.ResponseHeader{}
-	responseArray := make([]*server.ResponseOp, 0)
+	respHeader, responseArray := &server.ResponseHeader{}, make([]*server.ResponseOp, 0)
 	for i := range resp.Responses[0].GetResponseTxn().Responses {
 		responseArray = append(responseArray, resp.Responses[0].GetResponseTxn().Responses[i])
 	}
@@ -239,10 +240,10 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 			key := string(txn.opst[i].KeyBytes())
 			li := txn.lkv.leases.inCache(key)
 			if li != nil && txn.opst[i].IsPut() {
-				txn.lkv.leases.updateCacheResp(key, string(txn.opst[i].ValueBytes()), txnResp.Header)
+				txn.lkv.leases.updateCacheValue(key, string(txn.opst[i].ValueBytes()), txnResp.Header)
 			}
 			if li != nil && txn.opst[i].IsDelete() {
-				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(key))
+				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
 			}
 		}
 	}
@@ -251,10 +252,10 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 			key := string(txn.opse[i].KeyBytes())
 			li := txn.lkv.leases.inCache(key)
 			if li != nil && txn.opse[i].IsPut() {
-				txn.lkv.leases.updateCacheResp(key, string(txn.opse[i].ValueBytes()), txnResp.Header)
+				txn.lkv.leases.updateCacheValue(key, string(txn.opse[i].ValueBytes()), txnResp.Header)
 			}
 			if li != nil && txn.opse[i].IsDelete() {
-				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(key))
+				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
 			}
 		}
 	}
@@ -278,31 +279,6 @@ func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
 	return allOps
 }
 
-/*
-func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
-	allOps := make([]v3.Op, 0)
-	for _, op := range myOps {
-		allOps = append(allOps, txn.gatherAllOpsHelper(op)...)
-	}
-	return allOps
-}
-
-func (txn *txnLeasing) gatherAllOpsHelper(op v3.Op) []v3.Op {
-	if !op.IsTxn() {
-		return []v3.Op{op}
-	}
-	allOps := make([]v3.Op, 0)
-
-	_, thenOps, elseOps := op.Txn()
-	ops := append(thenOps, elseOps...)
-
-	for _, tmpOp := range ops {
-		allOps = append(allOps, txn.gatherAllOpsHelper(tmpOp)...)
-	}
-	return allOps
-}
-*/
-
 func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txnOps []v3.Op) error {
 	mapResp := make(map[string]bool)
 	for i := range elseOps {
@@ -320,4 +296,30 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 		}
 	}
 	return nil
+}
+
+func (lc *leaseCache) updateCacheValue(key, val string, respHeader *server.ResponseHeader) {
+	var wc chan struct{}
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	lc.entries[key].waitc = make(chan struct{})
+	wc = lc.entries[key].waitc
+	mapResp := lc.entries[key].response
+	if len(mapResp.Kvs) == 0 {
+		myKV := &mvccpb.KeyValue{
+			Value:   []byte(val),
+			Key:     []byte(key),
+			Version: 0,
+		}
+		mapResp.Kvs, mapResp.More, mapResp.Count = append(mapResp.Kvs, myKV), false, 1
+		mapResp.Kvs[0].CreateRevision = respHeader.Revision
+	}
+	if len(mapResp.Kvs) > 0 {
+		if mapResp.Kvs[0].ModRevision < respHeader.Revision {
+			mapResp.Header, mapResp.Kvs[0].Value = respHeader, []byte(val)
+			mapResp.Kvs[0].ModRevision = respHeader.Revision
+		}
+		mapResp.Kvs[0].Version++
+	}
+	close(wc)
 }
