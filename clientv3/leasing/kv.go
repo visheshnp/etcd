@@ -16,26 +16,27 @@ package leasing
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"sync"
 
 	v3 "github.com/coreos/etcd/clientv3"
 	concurrency "github.com/coreos/etcd/clientv3/concurrency"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"golang.org/x/net/context"
 )
 
 type leasingKV struct {
-	cl      *v3.Client
-	pfx     string
-	session *concurrency.Session
-	leases  leaseCache
-	ctx     context.Context
-	cancel  context.CancelFunc
-	header  *server.ResponseHeader
-	maxRev  int64
+	cl       *v3.Client
+	pfx      string
+	session  *concurrency.Session
+	leases   leaseCache
+	ctx      context.Context
+	cancel   context.CancelFunc
+	header   *server.ResponseHeader
+	maxRev   int64
+	sessionc chan struct{}
 }
 
 type leaseCache struct {
@@ -51,13 +52,34 @@ type leaseInfo struct {
 
 // NewleasingKV wraps a KV instance so that all requests are wired through a leasing protocol.
 func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
-	s, err := concurrency.NewSession(cl)
-	if err != nil {
-		return nil, err
-	}
+	s, sessionc, _ := newSession(cl)
 	cctx, cancel := context.WithCancel(s.Client().Ctx())
-	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1}, nil
+	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}, nil
 }
+
+func newSession(cl *v3.Client) (*concurrency.Session, chan struct{}, error) {
+	sessionc := make(chan struct{})
+	close(sessionc)
+	s, err := concurrency.NewSession(cl)
+	sessionc = make(chan struct{})
+	if err != nil {
+		return nil, sessionc, err
+	}
+	go monitorSession(s, sessionc)
+	return s, sessionc, nil
+}
+
+func monitorSession(s *concurrency.Session, sessionc chan struct{}) {
+	s.Done()
+	close(sessionc)
+	<-sessionc
+	//s, err = concurrency.NewSession(cl) // add ttl
+}
+
+/*
+func (lkv *leasingKV) sessionLeaseID() v3.LeaseID {
+
+}*/
 
 func (lc *leaseCache) inCache(key string) *leaseInfo {
 	lc.mu.Lock()
@@ -126,10 +148,12 @@ func (lkv *leasingKV) updateCache(ctx context.Context, key, val string, op v3.Op
 		return nil, errUpd
 	}
 	if respUpd.Succeeded && lkv.leases.inCache(key) != nil {
+		fmt.Println("succeed")
 		lkv.leases.updateCacheResp(key, val, respUpd.Header)
 	}
 	close(wc)
 	if !respUpd.Succeeded {
+		fmt.Println("fail")
 		return nil, nil
 	}
 	putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
@@ -387,7 +411,7 @@ func maxRev(getResp *v3.GetResponse) int64 {
 }
 
 func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.DeleteResponse, error) {
-	var wc chan struct{}
+	var wc [](chan struct{})
 	b := string(bytes.Trim(op.RangeBytes(), "\x00"))
 	var leasingendKey string
 	if len(b) != 0 {
@@ -396,7 +420,6 @@ func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.Del
 		leasingendKey = string(op.RangeBytes())
 	}
 	endKey := string(op.RangeBytes())
-
 	for ctx.Err() == nil {
 		if len(op.RangeBytes()) > 0 {
 			getResp, err := lkv.cl.Get(ctx, key, v3.WithRange(endKey))
@@ -410,16 +433,18 @@ func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.Del
 						if err != nil {
 							return nil, err
 						}
-						wc = lkv.allocateChannel(resp, string(getResp.Kvs[i].Key))
+						wc = append(wc, lkv.allocateChannel(resp, string(getResp.Kvs[i].Key)))
 					}
 				}
 				maxRev := maxRev(getResp)
-
 				txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(key).WithRange(endKey), "<", maxRev+1),
 					v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), ">", 0))
 				txn1 = txn1.Then(v3.OpDelete(key, v3.WithRange(endKey)), v3.OpDelete(lkv.pfx+key, v3.WithRange(leasingendKey)))
 				delRangeResp, err := txn1.Commit()
 				if err != nil {
+					for i := range wc {
+						close(wc[i])
+					}
 					return nil, err
 				}
 				if delRangeResp.Succeeded {
@@ -430,7 +455,6 @@ func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.Del
 					}
 					delResp := (*v3.DeleteResponse)(delRangeResp.Responses[0].GetResponseDeleteRange())
 					delResp.Header = respHeaderPopulate(delRangeResp.Header)
-					close(wc)
 					return delResp, nil
 				}
 				if !delRangeResp.Succeeded {
@@ -459,15 +483,11 @@ func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.Del
 }
 
 func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOption) (*v3.DeleteResponse, error) {
-	if len(key) == 0 {
-		return nil, rpctypes.ErrEmptyKey
-	}
 	r, err := lkv.Do(ctx, v3.OpDelete(key, opts...))
 	if err != nil {
 		return nil, err
 	}
-	del := r.Del()
-	return del, nil
+	return r.Del(), nil
 }
 
 type txnLeasing struct {
