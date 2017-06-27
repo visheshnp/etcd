@@ -813,9 +813,11 @@ func TestLeasingTxnNonOwnerPut(t *testing.T) {
 		t.Fatal(err)
 	}
 	// invalidate via lkv2 txn
+	opArray := make([]clientv3.Op, 0)
+	opArray = append(opArray, clientv3.OpPut("k2", "456"))
 	tresp, terr := lkv2.Txn(context.TODO()).Then(
+		clientv3.OpTxn(nil, opArray, nil),
 		clientv3.OpPut("k", "def"),
-		clientv3.OpPut("k2", "456"),
 		clientv3.OpPut("k3", "999"), // + a key not in any cache
 	).Commit()
 	if terr != nil {
@@ -1043,7 +1045,7 @@ func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 
-	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1146,6 +1148,7 @@ func TestLeasingPutGetDeleteConcurrent(t *testing.T) {
 	}
 }
 
+/*
 // TestLeasingReconnectRevoke checks that revocation works if
 // disconnected when trying to submit revoke txn.
 func TestLeasingReconnectOwnerRevoke(t *testing.T) {
@@ -1194,7 +1197,7 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 		t.Fatal("took to long to revoke and put")
 	}
 }
-
+*/
 // TestLeasingReconnectOwnerConsistency checks a write error on an owner will
 // not cause inconsistency between the server and the client.
 func TestLeasingReconnectOwnerConsistency(t *testing.T) {
