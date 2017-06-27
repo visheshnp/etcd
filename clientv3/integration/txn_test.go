@@ -160,3 +160,68 @@ func TestTxnSuccess(t *testing.T) {
 		t.Fatalf("unexpected Get response %v", resp)
 	}
 }
+
+func TestTxnCompareRange(t *testing.T) {
+	defer testutil.AfterTest(t)
+
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	kv := clus.Client(0)
+	fooResp, err := kv.Put(context.TODO(), "foo/", "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = kv.Put(context.TODO(), "foo/a", "baz"); err != nil {
+		t.Fatal(err)
+	}
+	tresp, terr := kv.Txn(context.TODO()).If(
+		clientv3.Compare(
+			clientv3.CreateRevision("foo/"), "=", fooResp.Header.Revision).
+			WithPrefix(),
+	).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if tresp.Succeeded {
+		t.Fatal("expected prefix compare to false, got compares as true")
+	}
+}
+
+func TestTxnNested(t *testing.T) {
+	defer testutil.AfterTest(t)
+
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	kv := clus.Client(0)
+
+	tresp, err := kv.Txn(context.TODO()).
+		If(clientv3.Compare(clientv3.Version("foo"), "=", 0)).
+		Then(
+			clientv3.OpPut("foo", "bar"),
+			clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpPut("abc", "123")}, nil)).
+		Else(clientv3.OpPut("foo", "baz")).Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tresp.Responses) != 2 {
+		t.Errorf("expected 2 top-level txn responses, got %+v", tresp.Responses)
+	}
+
+	// check txn writes were applied
+	resp, err := kv.Get(context.TODO(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != "bar" {
+		t.Errorf("unexpected Get response %+v", resp)
+	}
+	resp, err = kv.Get(context.TODO(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Kvs) != 1 || string(resp.Kvs[0].Value) != "123" {
+		t.Errorf("unexpected Get response %+v", resp)
+	}
+}

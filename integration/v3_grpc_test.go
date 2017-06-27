@@ -442,6 +442,148 @@ func TestV3TxnCmpHeaderRev(t *testing.T) {
 	}
 }
 
+// TestV3TxnRangeCompare tests range comparisons in txns
+func TestV3TxnRangeCompare(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := NewClusterV3(t, &ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	// put keys, named by expected revision
+	for _, k := range []string{"/a/2", "/a/3", "/a/4", "/f/5"} {
+		if _, err := clus.Client(0).Put(context.TODO(), k, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		cmp pb.Compare
+
+		wSuccess bool
+	}{
+		{
+			// >= /a/; all create revs fit
+			pb.Compare{
+				Key:         []byte("/a/"),
+				RangeEnd:    []byte{0},
+				Target:      pb.Compare_CREATE,
+				Result:      pb.Compare_LESS,
+				TargetUnion: &pb.Compare_CreateRevision{6},
+			},
+			true,
+		},
+		{
+			// >= /a/; one create rev doesn't fit
+			pb.Compare{
+				Key:         []byte("/a/"),
+				RangeEnd:    []byte{0},
+				Target:      pb.Compare_CREATE,
+				Result:      pb.Compare_LESS,
+				TargetUnion: &pb.Compare_CreateRevision{5},
+			},
+			false,
+		},
+		{
+			// prefix /a/*; all create revs fit
+			pb.Compare{
+				Key:         []byte("/a/"),
+				RangeEnd:    []byte("/a0"),
+				Target:      pb.Compare_CREATE,
+				Result:      pb.Compare_LESS,
+				TargetUnion: &pb.Compare_CreateRevision{5},
+			},
+			true,
+		},
+		{
+			// prefix /a/*; one create rev doesn't fit
+			pb.Compare{
+				Key:         []byte("/a/"),
+				RangeEnd:    []byte("/a0"),
+				Target:      pb.Compare_CREATE,
+				Result:      pb.Compare_LESS,
+				TargetUnion: &pb.Compare_CreateRevision{4},
+			},
+			false,
+		},
+		{
+			// does not exist, does not succeed
+			pb.Compare{
+				Key:         []byte("/b/"),
+				RangeEnd:    []byte("/b0"),
+				Target:      pb.Compare_VALUE,
+				Result:      pb.Compare_EQUAL,
+				TargetUnion: &pb.Compare_Value{[]byte("x")},
+			},
+			false,
+		},
+	}
+
+	kvc := toGRPC(clus.Client(0)).KV
+	for i, tt := range tests {
+		txn := &pb.TxnRequest{}
+		txn.Compare = append(txn.Compare, &tt.cmp)
+		tresp, err := kvc.Txn(context.TODO(), txn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tt.wSuccess != tresp.Succeeded {
+			t.Errorf("#%d: expected %v, got %v", i, tt.wSuccess, tresp.Succeeded)
+		}
+	}
+}
+
+// TestV3TxnNested tests nested txns follow paths as expected.
+func TestV3TxnNestedPath(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := NewClusterV3(t, &ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	kvc := toGRPC(clus.RandClient()).KV
+
+	cmpTrue := &pb.Compare{
+		Result:      pb.Compare_EQUAL,
+		Target:      pb.Compare_VERSION,
+		Key:         []byte("k"),
+		TargetUnion: &pb.Compare_Version{Version: int64(0)},
+	}
+	cmpFalse := &pb.Compare{
+		Result:      pb.Compare_EQUAL,
+		Target:      pb.Compare_VERSION,
+		Key:         []byte("k"),
+		TargetUnion: &pb.Compare_Version{Version: int64(1)},
+	}
+
+	// generate random path to eval txns
+	topTxn := &pb.TxnRequest{}
+	txn := topTxn
+	txnPath := make([]bool, 10)
+	for i := range txnPath {
+		nextTxn := &pb.TxnRequest{}
+		op := &pb.RequestOp{Request: &pb.RequestOp_RequestTxn{RequestTxn: nextTxn}}
+		txnPath[i] = rand.Intn(2) == 0
+		if txnPath[i] {
+			txn.Compare = append(txn.Compare, cmpTrue)
+			txn.Success = append(txn.Success, op)
+		} else {
+			txn.Compare = append(txn.Compare, cmpFalse)
+			txn.Failure = append(txn.Failure, op)
+		}
+		txn = nextTxn
+	}
+
+	tresp, err := kvc.Txn(context.TODO(), topTxn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	curTxnResp := tresp
+	for i := range txnPath {
+		if curTxnResp.Succeeded != txnPath[i] {
+			t.Fatalf("expected path %+v, got response %+v", txnPath, *tresp)
+		}
+		curTxnResp = curTxnResp.Responses[0].Response.(*pb.ResponseOp_ResponseTxn).ResponseTxn
+	}
+}
+
 // TestV3PutIgnoreValue ensures that writes with ignore_value overwrites with previous key-value pair.
 func TestV3PutIgnoreValue(t *testing.T) {
 	defer testutil.AfterTest(t)
@@ -1670,7 +1812,7 @@ func TestGRPCRequireLeader(t *testing.T) {
 	time.Sleep(time.Duration(3*electionTicks) * tickDuration)
 
 	md := metadata.Pairs(rpctypes.MetadataRequireLeaderKey, rpctypes.MetadataHasLeader)
-	ctx := metadata.NewContext(context.Background(), md)
+	ctx := metadata.NewOutgoingContext(context.Background(), md)
 	reqput := &pb.PutRequest{Key: []byte("foo"), Value: []byte("bar")}
 	if _, err := toGRPC(client).KV.Put(ctx, reqput); grpc.ErrorDesc(err) != rpctypes.ErrNoLeader.Error() {
 		t.Errorf("err = %v, want %v", err, rpctypes.ErrNoLeader)
@@ -1692,7 +1834,7 @@ func TestGRPCStreamRequireLeader(t *testing.T) {
 
 	wAPI := toGRPC(client).Watch
 	md := metadata.Pairs(rpctypes.MetadataRequireLeaderKey, rpctypes.MetadataHasLeader)
-	ctx := metadata.NewContext(context.Background(), md)
+	ctx := metadata.NewOutgoingContext(context.Background(), md)
 	wStream, err := wAPI.Watch(ctx)
 	if err != nil {
 		t.Fatalf("wAPI.Watch error: %v", err)

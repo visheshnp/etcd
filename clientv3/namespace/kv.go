@@ -89,7 +89,6 @@ func (kv *kvPrefix) Do(ctx context.Context, op clientv3.Op) (clientv3.OpResponse
 	case r.Del() != nil:
 		kv.unprefixDeleteResponse(r.Del())
 	case r.Txn() != nil:
-		panic("hi")
 		kv.unprefixTxnResponse(r.Txn())
 	}
 	return r, nil

@@ -200,6 +200,7 @@ func checkIntervals(reqs []*pb.RequestOp) (map[string]struct{}, adt.IntervalTree
 	}
 
 	// collect children puts/deletes
+
 	for _, req := range reqs {
 		tv, ok := req.Request.(*pb.RequestOp_RequestTxn)
 		if !ok {
@@ -235,6 +236,7 @@ func checkIntervals(reqs []*pb.RequestOp) (map[string]struct{}, adt.IntervalTree
 			}
 			puts[k] = struct{}{}
 		}
+
 		dels.Union(delsThen, adt.NewStringAffineInterval("\x00", ""))
 		dels.Union(delsElse, adt.NewStringAffineInterval("\x00", ""))
 	}
@@ -272,5 +274,4 @@ func checkRequestOp(u *pb.RequestOp, maxTxnOps int) error {
 		// empty op / nil entry
 		return rpctypes.ErrGRPCKeyNotFound
 	}
-	return nil
 }
