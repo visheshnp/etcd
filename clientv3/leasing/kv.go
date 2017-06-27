@@ -16,7 +16,6 @@ package leasing
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"sync"
 
@@ -28,15 +27,14 @@ import (
 )
 
 type leasingKV struct {
-	cl       *v3.Client
-	pfx      string
-	session  *concurrency.Session
-	leases   leaseCache
-	ctx      context.Context
-	cancel   context.CancelFunc
-	header   *server.ResponseHeader
-	maxRev   int64
-	sessionc chan struct{}
+	cl      *v3.Client
+	pfx     string
+	session *concurrency.Session
+	leases  leaseCache
+	ctx     context.Context
+	cancel  context.CancelFunc
+	header  *server.ResponseHeader
+	maxRev  int64
 }
 
 type leaseCache struct {
@@ -52,34 +50,65 @@ type leaseInfo struct {
 
 // NewleasingKV wraps a KV instance so that all requests are wired through a leasing protocol.
 func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
-	s, sessionc, _ := newSession(cl)
-	cctx, cancel := context.WithCancel(s.Client().Ctx())
-	return &leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}, nil
-}
-
-func newSession(cl *v3.Client) (*concurrency.Session, chan struct{}, error) {
-	sessionc := make(chan struct{})
-	close(sessionc)
 	s, err := concurrency.NewSession(cl)
-	sessionc = make(chan struct{})
 	if err != nil {
-		return nil, sessionc, err
+		return nil, err
 	}
-	go monitorSession(s, sessionc)
-	return s, sessionc, nil
-}
-
-func monitorSession(s *concurrency.Session, sessionc chan struct{}) {
-	s.Done()
-	close(sessionc)
-	<-sessionc
-	//s, err = concurrency.NewSession(cl) // add ttl
+	cctx, cancel := context.WithCancel(cl.Ctx())
+	kv := leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1}
+	go kv.monitorSession(cl)
+	return &kv, nil
 }
 
 /*
-func (lkv *leasingKV) sessionLeaseID() v3.LeaseID {
-
+// NewleasingKVTTL wraps a KV instance so that all requests are wired through a leasing protocol(use TTL for session)
+func NewleasingKVTTL(cl *v3.Client, leasingprefix string, ttl int) (v3.KV, error) {
+	s, err := concurrency.NewSession(cl, concurrency.WithTTL(ttl))
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithCancel(cl.Ctx())
+	kv := leasingKV{cl: cl, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1}
+	go kv.monitorSession(cl, s, ttl)
+	return &kv, nil
 }*/
+
+func (lkv *leasingKV) monitorSession(cl *v3.Client) {
+	for {
+		_, ok := <-lkv.session.Done()
+		if !ok { //closed channel
+			select {
+			case <-lkv.ctx.Done(): //closed client
+				return
+			default: //lease expired
+				lkv.leases.mu.Lock()
+				defer lkv.leases.mu.Unlock()
+				for k := range lkv.leases.entries {
+					delete(lkv.leases.entries, k)
+				}
+				s, err := concurrency.NewSession(cl)
+				if err == nil {
+					go lkv.monitorSession(cl)
+					lkv.session = s
+				}
+				if err != nil {
+					continue
+				}
+				return
+			}
+		}
+	}
+}
+
+func (lkv *leasingKV) checkOpenChannel(s *concurrency.Session) bool {
+	var openChannel bool
+	select {
+	case <-s.Done():
+	default:
+		return !openChannel
+	}
+	return openChannel
+}
 
 func (lc *leaseCache) inCache(key string) *leaseInfo {
 	lc.mu.Lock()
@@ -148,12 +177,10 @@ func (lkv *leasingKV) updateCache(ctx context.Context, key, val string, op v3.Op
 		return nil, errUpd
 	}
 	if respUpd.Succeeded && lkv.leases.inCache(key) != nil {
-		fmt.Println("succeed")
 		lkv.leases.updateCacheResp(key, val, respUpd.Header)
 	}
 	close(wc)
 	if !respUpd.Succeeded {
-		fmt.Println("fail")
 		return nil, nil
 	}
 	putResp := (*v3.PutResponse)(respUpd.Responses[0].GetResponsePut())
@@ -176,23 +203,25 @@ func (lkv *leasingKV) watchforLKDel(ctx context.Context, key string, rev int64) 
 
 func (lkv *leasingKV) put(ctx context.Context, key, val string, op v3.Op) (*v3.PutResponse, error) {
 	for ctx.Err() == nil {
-		respPut, err := lkv.updateCache(ctx, key, val, op)
-		if respPut != nil || err != nil {
-			return respPut, err
-		}
-		if lkv.leases.inCache(key) == nil {
-			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(op)
-			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
-			resp, err := txn.Commit()
-			if err != nil {
-				return nil, err
+		if lkv.checkOpenChannel(lkv.session) {
+			respPut, err := lkv.updateCache(ctx, key, val, op)
+			if respPut != nil || err != nil {
+				return respPut, err
 			}
-			if resp.Succeeded {
-				response := (*v3.PutResponse)(resp.Responses[0].GetResponsePut())
-				response.Header = respHeaderPopulate(resp.Header)
-				return response, err
+			if lkv.leases.inCache(key) == nil {
+				txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(op)
+				txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+				resp, err := txn.Commit()
+				if err != nil {
+					return nil, err
+				}
+				if resp.Succeeded {
+					response := (*v3.PutResponse)(resp.Responses[0].GetResponsePut())
+					response.Header = respHeaderPopulate(resp.Header)
+					return response, err
+				}
+				lkv.watchforLKDel(ctx, key, resp.Header.Revision)
 			}
-			lkv.watchforLKDel(ctx, key, resp.Header.Revision)
 		}
 	}
 	return nil, ctx.Err()
@@ -343,19 +372,23 @@ func (lkv *leasingKV) get(ctx context.Context, key string, op v3.Op) (*v3.GetRes
 }
 
 func (lkv *leasingKV) Get(ctx context.Context, key string, opts ...v3.OpOption) (*v3.GetResponse, error) {
-	if len(opts) > 0 && len(v3.OpGet(key, opts...).RangeBytes()) > 0 || !(v3.OpGet(key, opts...).IsKeysOnly()) &&
-		(len(opts) > 0 && v3.OpGet(key, opts...).Rev() > 0) {
-		r, err := lkv.cl.Do(ctx, v3.OpGet(key, opts...))
+	if lkv.checkOpenChannel(lkv.session) {
+		if len(opts) > 0 && len(v3.OpGet(key, opts...).RangeBytes()) > 0 || !(v3.OpGet(key, opts...).IsKeysOnly()) &&
+			(len(opts) > 0 && v3.OpGet(key, opts...).Rev() > 0) {
+			r, err := lkv.cl.Do(ctx, v3.OpGet(key, opts...))
+			if err != nil {
+				return nil, err
+			}
+			return r.Get(), nil
+		}
+		r, err := lkv.Do(ctx, v3.OpGet(key, opts...))
 		if err != nil {
 			return nil, err
 		}
 		return r.Get(), nil
 	}
-	r, err := lkv.Do(ctx, v3.OpGet(key, opts...))
-	if err != nil {
-		return nil, err
-	}
-	return r.Get(), nil
+	//lease expired
+	return lkv.cl.Get(ctx, key, opts...)
 }
 
 func (lkv *leasingKV) deleteKey(ctx context.Context, key string, op v3.Op) (*v3.DeleteResponse, error) {
@@ -421,62 +454,64 @@ func (lkv *leasingKV) delete(ctx context.Context, key string, op v3.Op) (*v3.Del
 	}
 	endKey := string(op.RangeBytes())
 	for ctx.Err() == nil {
-		if len(op.RangeBytes()) > 0 {
-			getResp, err := lkv.cl.Get(ctx, key, v3.WithRange(endKey))
-			if err != nil {
-				return nil, err
-			}
-			if len(getResp.Kvs) > 0 {
-				for i := range getResp.Kvs {
-					if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; !ok {
-						resp, err := lkv.acquireLease(ctx, string(getResp.Kvs[i].Key), v3.OpGet(string(getResp.Kvs[i].Key)))
-						if err != nil {
-							return nil, err
-						}
-						wc = append(wc, lkv.allocateChannel(resp, string(getResp.Kvs[i].Key)))
-					}
-				}
-				maxRev := maxRev(getResp)
-				txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(key).WithRange(endKey), "<", maxRev+1),
-					v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), ">", 0))
-				txn1 = txn1.Then(v3.OpDelete(key, v3.WithRange(endKey)), v3.OpDelete(lkv.pfx+key, v3.WithRange(leasingendKey)))
-				delRangeResp, err := txn1.Commit()
+		if lkv.checkOpenChannel(lkv.session) {
+			if len(op.RangeBytes()) > 0 {
+				getResp, err := lkv.cl.Get(ctx, key, v3.WithRange(endKey))
 				if err != nil {
-					for i := range wc {
-						close(wc[i])
-					}
 					return nil, err
 				}
-				if delRangeResp.Succeeded {
+				if len(getResp.Kvs) > 0 {
 					for i := range getResp.Kvs {
-						if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; ok {
-							lkv.leases.deleteKeyInCache(string(getResp.Kvs[i].Key))
+						if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; !ok {
+							resp, err := lkv.acquireLease(ctx, string(getResp.Kvs[i].Key), v3.OpGet(string(getResp.Kvs[i].Key)))
+							if err != nil {
+								return nil, err
+							}
+							wc = append(wc, lkv.allocateChannel(resp, string(getResp.Kvs[i].Key)))
 						}
 					}
-					delResp := (*v3.DeleteResponse)(delRangeResp.Responses[0].GetResponseDeleteRange())
-					delResp.Header = respHeaderPopulate(delRangeResp.Header)
-					return delResp, nil
+					maxRev := maxRev(getResp)
+					txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(key).WithRange(endKey), "<", maxRev+1),
+						v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), ">", 0))
+					txn1 = txn1.Then(v3.OpDelete(key, v3.WithRange(endKey)), v3.OpDelete(lkv.pfx+key, v3.WithRange(leasingendKey)))
+					delRangeResp, err := txn1.Commit()
+					if err != nil {
+						for i := range wc {
+							close(wc[i])
+						}
+						return nil, err
+					}
+					if delRangeResp.Succeeded {
+						for i := range getResp.Kvs {
+							if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; ok {
+								lkv.leases.deleteKeyInCache(string(getResp.Kvs[i].Key))
+							}
+						}
+						delResp := (*v3.DeleteResponse)(delRangeResp.Responses[0].GetResponseDeleteRange())
+						delResp.Header = respHeaderPopulate(delRangeResp.Header)
+						return delResp, nil
+					}
+					if !delRangeResp.Succeeded {
+						continue
+					}
 				}
-				if !delRangeResp.Succeeded {
-					continue
+			}
+			respDel, err := lkv.deleteKey(ctx, key, op)
+			if respDel != nil || err != nil {
+				return respDel, err
+			}
+			if lkv.leases.inCache(key) == nil {
+				txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(op)
+				txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+				resp, err := txn.Commit()
+				if err != nil {
+					return nil, err
 				}
+				if resp.Succeeded {
+					return (*v3.DeleteResponse)(resp.Responses[0].GetResponseDeleteRange()), nil
+				}
+				lkv.watchforLKDel(ctx, key, resp.Header.Revision)
 			}
-		}
-		respDel, err := lkv.deleteKey(ctx, key, op)
-		if respDel != nil || err != nil {
-			return respDel, err
-		}
-		if lkv.leases.inCache(key) == nil {
-			txn := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(op)
-			txn = txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
-			resp, err := txn.Commit()
-			if err != nil {
-				return nil, err
-			}
-			if resp.Succeeded {
-				return (*v3.DeleteResponse)(resp.Responses[0].GetResponseDeleteRange()), nil
-			}
-			lkv.watchforLKDel(ctx, key, resp.Header.Revision)
 		}
 	}
 	return nil, ctx.Err()
@@ -536,40 +571,47 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 			return txnResp, nil
 		}
 		if responseArray, ok := txn.cacheOpArray(opArray); ok {
-			return txn.lkv.allInCache(responseArray, cacheBool)
+			if txn.lkv.checkOpenChannel(txn.lkv.session) {
+				return txn.lkv.allInCache(responseArray, cacheBool)
+			}
+			return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
 		}
 		serverTxnBool = !serverTxnBool
 	}
-	if serverTxnBool {
-		allOps := append(txn.opst, txn.opse...)
-		txnOps := txn.gatherAllOps(allOps)
-		flag := true
-		for flag {
-			elseOps, cmps := txn.cmpUpdate(txnOps)
-			resp, err := txn.lkv.cl.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
-			if err != nil {
-				for i := range cmps {
-					key := string(cmps[i].Key)
-					if txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)) != nil {
-						txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(key, txn.lkv.pfx))
+	for {
+		if txn.lkv.checkOpenChannel(txn.lkv.session) {
+			if serverTxnBool {
+				allOps := append(txn.opst, txn.opse...)
+				txnOps := txn.gatherAllOps(allOps)
+				flag := true
+				for flag {
+					elseOps, cmps := txn.cmpUpdate(txnOps)
+					resp, err := txn.lkv.cl.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
+					if err != nil {
+						for i := range cmps {
+							key := string(cmps[i].Key)
+							if txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)) != nil {
+								txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(key, txn.lkv.pfx))
+							}
+						}
+						return nil, err
+					}
+					if !resp.Succeeded {
+						err := txn.NonOwnerRevoke(resp, elseOps, txnOps)
+						if err != nil {
+							return nil, err
+						}
+					}
+					if resp.Succeeded {
+						txnResp = txn.extractResp(resp)
+						txn.modifyCacheTxn(txnResp)
+						flag = false
 					}
 				}
-				return nil, err
 			}
-			if !resp.Succeeded {
-				err := txn.NonOwnerRevoke(resp, elseOps, txnOps)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if resp.Succeeded {
-				txnResp = txn.extractResp(resp)
-				txn.modifyCacheTxn(txnResp)
-				flag = false
-			}
+			return txnResp, nil
 		}
 	}
-	return txnResp, nil
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
