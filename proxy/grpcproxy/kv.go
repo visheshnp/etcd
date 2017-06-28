@@ -16,6 +16,7 @@ package grpcproxy
 
 import (
 	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/clientv3/leasing"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/proxy/grpcproxy/cache"
 
@@ -30,6 +31,17 @@ type kvProxy struct {
 func NewKvProxy(c *clientv3.Client) (pb.KVServer, <-chan struct{}) {
 	kv := &kvProxy{
 		kv:    c.KV,
+		cache: cache.NewCache(cache.DefaultMaxEntries),
+	}
+	donec := make(chan struct{})
+	close(donec)
+	return kv, donec
+}
+
+func NewleasingKVProxy(c *clientv3.Client, leasingprefix string) (pb.KVServer, <-chan struct{}) {
+	lkv, _ := leasing.NewleasingKV(c, leasingprefix)
+	kv := &kvProxy{
+		kv:    lkv,
 		cache: cache.NewCache(cache.DefaultMaxEntries),
 	}
 	donec := make(chan struct{})
