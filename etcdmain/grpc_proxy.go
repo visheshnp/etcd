@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/clientv3/leasing"
 	"github.com/coreos/etcd/clientv3/namespace"
 	"github.com/coreos/etcd/etcdserver/api/v3election/v3electionpb"
 	"github.com/coreos/etcd/etcdserver/api/v3lock/v3lockpb"
@@ -54,6 +55,7 @@ var (
 	grpcProxyResolverTTL        int
 
 	grpcProxyNamespace string
+	grpcProxyLeasing   string
 
 	grpcProxyEnablePprof bool
 )
@@ -92,6 +94,7 @@ func newGRPCProxyStartCommand() *cobra.Command {
 	cmd.Flags().StringVar(&grpcProxyResolverPrefix, "resolver-prefix", "", "prefix to use for registering proxy (must be shared with other grpc-proxy members)")
 	cmd.Flags().IntVar(&grpcProxyResolverTTL, "resolver-ttl", 0, "specify TTL, in seconds, when registering proxy endpoints")
 	cmd.Flags().StringVar(&grpcProxyNamespace, "namespace", "", "string to prefix to all keys for namespacing requests")
+	cmd.Flags().StringVar(&grpcProxyLeasing, "leasing-prefix", "", "string to prefix to denote lease for a key")
 	cmd.Flags().BoolVar(&grpcProxyEnablePprof, "enable-pprof", false, `Enable runtime profiling data via HTTP server. Address is at client URL + "/debug/pprof/"`)
 
 	return &cmd
@@ -148,6 +151,10 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 		client.KV = namespace.NewKV(client.KV, grpcProxyNamespace)
 		client.Watcher = namespace.NewWatcher(client.Watcher, grpcProxyNamespace)
 		client.Lease = namespace.NewLease(client.Lease, grpcProxyNamespace)
+	}
+
+	if len(grpcProxyLeasing) > 0 {
+		client.KV, _ = leasing.NewleasingKV(client, grpcProxyLeasing)
 	}
 
 	kvp, _ := grpcproxy.NewKvProxy(client)
