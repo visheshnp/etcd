@@ -148,6 +148,7 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 	}
 
 	kvp, _ := grpcproxy.NewKvProxy(client)
+	//lkvp, _ := grpcproxy.NewleasingKVProxy(client, "0/")
 	watchp, _ := grpcproxy.NewWatchProxy(client)
 	if grpcProxyResolverPrefix != "" {
 		grpcproxy.Register(client, grpcProxyResolverPrefix, grpcProxyAdvertiseClientURL, grpcProxyResolverTTL)
@@ -164,6 +165,7 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 		grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
 	)
 	pb.RegisterKVServer(server, kvp)
+	//	pb.RegisterKVServer(server, lkvp)
 	pb.RegisterWatchServer(server, watchp)
 	pb.RegisterClusterServer(server, clusterp)
 	pb.RegisterLeaseServer(server, leasep)
