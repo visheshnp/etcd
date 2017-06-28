@@ -235,28 +235,21 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 }
 
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
+	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
-		for i := range txn.opst {
-			key := string(txn.opst[i].KeyBytes())
-			li := txn.lkv.leases.inCache(key)
-			if li != nil && txn.opst[i].IsPut() {
-				txn.lkv.leases.updateCacheValue(key, string(txn.opst[i].ValueBytes()), txnResp.Header)
-			}
-			if li != nil && txn.opst[i].IsDelete() {
-				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
-			}
-		}
+		temp = append(txn.opst)
 	}
 	if !txnResp.Succeeded && len(txn.opse) != 0 {
-		for i := range txn.opse {
-			key := string(txn.opse[i].KeyBytes())
-			li := txn.lkv.leases.inCache(key)
-			if li != nil && txn.opse[i].IsPut() {
-				txn.lkv.leases.updateCacheValue(key, string(txn.opse[i].ValueBytes()), txnResp.Header)
-			}
-			if li != nil && txn.opse[i].IsDelete() {
-				txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
-			}
+		temp = append(txn.opse)
+	}
+	for i := range temp {
+		key := string(temp[i].KeyBytes())
+		li := txn.lkv.leases.inCache(key)
+		if li != nil && temp[i].IsPut() {
+			txn.lkv.leases.updateCacheValue(key, string(temp[i].ValueBytes()), txnResp.Header)
+		}
+		if li != nil && temp[i].IsDelete() {
+			txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
 		}
 	}
 }
