@@ -614,14 +614,12 @@ func TestLeasingTxnOwnerGet(t *testing.T) {
 
 	var thenOps, elseOps []clientv3.Op
 	cmps, useThen := randCmps("k-", presps)
-	fmt.Printf("cmps %+v\n", cmps)
-	fmt.Printf("useThen %+v\n", useThen)
+
 	if useThen {
-		fmt.Printf("thenops %+v\n", ops)
+
 		thenOps = ops
 		elseOps = []clientv3.Op{clientv3.OpPut("k", "1")}
 	} else {
-		fmt.Printf("elseops %+v\n", ops)
 		thenOps = []clientv3.Op{clientv3.OpPut("k", "1")}
 		elseOps = ops
 	}
@@ -630,9 +628,6 @@ func TestLeasingTxnOwnerGet(t *testing.T) {
 		If(cmps...).
 		Then(thenOps...).
 		Else(elseOps...).Commit()
-
-	fmt.Printf("lastput %+v\n", presps[len(presps)-1])
-	fmt.Printf("tresp %+v\n", tresp)
 
 	if terr != nil {
 		t.Fatal(terr)
@@ -1468,7 +1463,51 @@ func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, the
 		return cmps, true
 	}
 	i := rand.Intn(len(dat))
-	fmt.Println("here")
 	cmps = append(cmps, clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", i)), "=", 0))
 	return cmps, false
+}
+func TestLeasingSession(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 2})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKVTTL(clus.Client(0), "foo/", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lkv2, err := leasing.NewleasingKVTTL(clus.Client(1), "foo/", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t1 := time.Now()
+	_, err = lkv.Get(context.TODO(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clus.Members[0].Stop(t)
+
+	for {
+		t2 := time.Now()
+		diff := t2.Sub(t1)
+		if diff.Seconds() > 2 {
+			break
+		}
+	}
+
+	clus.Members[0].Restart(t)
+
+	if _, err = lkv2.Put(context.TODO(), "abc", "def"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := lkv.Get(context.TODO(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := string(resp.Kvs[0].Value); v != "def" {
+		t.Fatalf("expected %q, got %q", "v", v)
+	}
 }
