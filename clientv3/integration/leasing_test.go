@@ -1466,37 +1466,39 @@ func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, the
 	cmps = append(cmps, clientv3.Compare(clientv3.Version(fmt.Sprintf("k-%d", i)), "=", 0))
 	return cmps, false
 }
-func TestLeasingSession(t *testing.T) {
+
+func TestLeasingSessionExpire(t *testing.T) {
 	defer testutil.AfterTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 2})
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	lkv, err := leasing.NewleasingKVTTL(clus.Client(0), "foo/", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	lkv2, err := leasing.NewleasingKVTTL(clus.Client(1), "foo/", 1)
+	lkv2, err := leasing.NewleasingKV(clus.Client(0), "foo/")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t1 := time.Now()
-	_, err = lkv.Get(context.TODO(), "abc")
-	if err != nil {
+	// acquire lease on abc
+	if _, err := lkv.Get(context.TODO(), "abc"); err != nil {
 		t.Fatal(err)
 	}
 
+	// down endpoint lkv uses for keepalives
 	clus.Members[0].Stop(t)
-
 	for {
-		t2 := time.Now()
-		diff := t2.Sub(t1)
-		if diff.Seconds() > 2 {
+		time.Sleep(1 * time.Second)
+		resp, err := clus.Client(1).Get(context.TODO(), "foo/abc", clientv3.WithPrefix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Kvs) == 0 {
+			// server expired the leasing key
 			break
 		}
 	}
-
 	clus.Members[0].Restart(t)
 
 	if _, err = lkv2.Put(context.TODO(), "abc", "def"); err != nil {
