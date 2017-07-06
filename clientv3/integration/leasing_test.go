@@ -1540,3 +1540,47 @@ func TestLeasingSessionExpire(t *testing.T) {
 		t.Fatalf("expected %q, got %q", "v", v)
 	}
 }
+
+func TestLeasingSessionExpireCancel(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKVTTL(clus.Client(0), "foo/", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lkv.Get(context.TODO(), "abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	// down endpoint lkv uses for keepalives
+	clus.Members[0].Stop(t)
+	for {
+		time.Sleep(1 * time.Second)
+		resp, err := clus.Client(1).Get(context.TODO(), "foo/abc", clientv3.WithPrefix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Kvs) == 0 {
+			// server expired the leasing key
+			break
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := lkv.Get(ctx, "abc")
+		errc <- err
+	}()
+	cancel()
+	select {
+	case err := <-errc:
+		if err != ctx.Err() {
+			t.Fatalf("expected %v, got %v", ctx.Err(), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for get to cancel")
+	}
+}
