@@ -1085,6 +1085,65 @@ func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	}
 }
 
+func TestLeasingDeleteRangeContend(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	delkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("key/%d", i)
+		if _, err := clus.Client(0).Put(context.TODO(), key, "123"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := putkv.Get(context.TODO(), key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	donec := make(chan struct{})
+	go func() {
+		defer close(donec)
+		for i := 0; ctx.Err() == nil; i++ {
+			key := fmt.Sprintf("key/%d", i%8)
+			putkv.Put(ctx, key, "123")
+			putkv.Get(ctx, key)
+		}
+	}()
+
+	_, delErr := delkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	cancel()
+	<-donec
+	if delErr != nil {
+		t.Fatal(delErr)
+	}
+
+	// confirm keys on non-deleter match etcd
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("key/%d", i)
+		resp, err := putkv.Get(context.TODO(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		servResp, err := clus.Client(0).Get(context.TODO(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(resp.Kvs, servResp.Kvs) {
+			t.Errorf("#%d: expected %+v, got %+v", i, servResp.Kvs, resp.Kvs)
+		}
+	}
+}
+
 func TestLeasingPutGetDeleteConcurrent(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
