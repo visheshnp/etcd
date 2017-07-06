@@ -1402,7 +1402,7 @@ func TestLeasingDo(t *testing.T) {
 
 func TestLeasingTxnOwnerPutBranch(t *testing.T) {
 	defer testutil.AfterTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
@@ -1410,33 +1410,61 @@ func TestLeasingTxnOwnerPutBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := clus.Client(0).Put(context.TODO(), "k", "v"); err != nil {
-		t.Fatal(err)
+	n := 0
+	treeOp := makePutTreeOp("tree", &n, 4)
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("tree/%d", i)
+		if _, err := clus.Client(0).Put(context.TODO(), k, "a"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := lkv.Get(context.TODO(), k); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := clus.Client(0).Put(context.TODO(), "k2", "v"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lkv.Get(context.TODO(), "k2"); err != nil {
+
+	if _, err := lkv.Do(context.TODO(), treeOp); err != nil {
 		t.Fatal(err)
 	}
 
-	txn := lkv.Txn(context.TODO()).If(clientv3.Compare(clientv3.Version("k"), "=", 0)).
-		Then(clientv3.OpPut("k", "x")).
-		Else(clientv3.OpPut("k2", "y"))
-	if _, err := txn.Commit(); err != nil {
-		t.Fatal(err)
+	// lkv shouldn't need to call out to server for updated leased keys
+	clus.Members[0].Stop(t)
+
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("tree/%d", i)
+		lkvResp, err := lkv.Get(context.TODO(), k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clusResp, err := clus.Client(1).Get(context.TODO(), k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(clusResp.Kvs, lkvResp.Kvs) {
+			t.Fatalf("expected %+v, got %+v", clusResp.Kvs, lkvResp.Kvs)
+		}
+	}
+}
+
+func makePutTreeOp(pfx string, v *int, depth int) clientv3.Op {
+	key := fmt.Sprintf("%s/%d", pfx, *v)
+	*v = *v + 1
+	if depth == 0 {
+		return clientv3.OpPut(key, "leaf")
 	}
 
-	resp, err := lkv.Get(context.TODO(), "k")
-	if err != nil {
-		t.Fatal(err)
+	t, e := makePutTreeOp(pfx, v, depth-1), makePutTreeOp(pfx, v, depth-1)
+	tPut, ePut := clientv3.OpPut(key, "then"), clientv3.OpPut(key, "else")
+
+	cmps := make([]clientv3.Cmp, 1)
+	if rand.Intn(2) == 0 {
+		// follow then path
+		cmps[0] = clientv3.Compare(clientv3.Version("nokey"), "=", 0)
+	} else {
+		// follow else path
+		cmps[0] = clientv3.Compare(clientv3.Version("nokey"), ">", 0)
 	}
-	if v := string(resp.Kvs[0].Value); v != "v" {
-		t.Fatalf("expected %q, got %q", "v", v)
-	}
+
+	return clientv3.OpTxn(cmps, []clientv3.Op{t, tPut}, []clientv3.Op{e, ePut})
 }
 
 func randCmps(pfx string, dat []*clientv3.PutResponse) (cmps []clientv3.Cmp, then bool) {
