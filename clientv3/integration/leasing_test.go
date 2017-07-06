@@ -1143,7 +1143,6 @@ func TestLeasingPutGetDeleteConcurrent(t *testing.T) {
 	}
 }
 
-/*
 // TestLeasingReconnectRevoke checks that revocation works if
 // disconnected when trying to submit revoke txn.
 func TestLeasingReconnectOwnerRevoke(t *testing.T) {
@@ -1192,7 +1191,7 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 		t.Fatal("took to long to revoke and put")
 	}
 }
-*/
+
 // TestLeasingReconnectOwnerConsistency checks a write error on an owner will
 // not cause inconsistency between the server and the client.
 func TestLeasingReconnectOwnerConsistency(t *testing.T) {
