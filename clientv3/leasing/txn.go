@@ -237,10 +237,10 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
-		temp = append(txn.opst)
+		temp = txn.gatherAllOps(txn.opst)
 	}
 	if !txnResp.Succeeded && len(txn.opse) != 0 {
-		temp = append(txn.opse)
+		temp = txn.gatherAllOps(txn.opse)
 	}
 	for i := range temp {
 		key := string(temp[i].KeyBytes())
