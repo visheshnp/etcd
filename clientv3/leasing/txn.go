@@ -2,6 +2,7 @@ package leasing
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -237,11 +238,13 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
-		temp = txn.gatherAllOps(txn.opst)
+		fmt.Println(txnResp.Responses[0])
+		temp = txn.gatherOps(txnResp.Responses[0], txn.opst)
 	}
 	if !txnResp.Succeeded && len(txn.opse) != 0 {
-		temp = txn.gatherAllOps(txn.opse)
+		temp = txn.gatherOps(txnResp.Responses[0], txn.opse)
 	}
+
 	for i := range temp {
 		key := string(temp[i].KeyBytes())
 		li := txn.lkv.leases.inCache(key)
@@ -252,6 +255,27 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 			txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
 		}
 	}
+}
+
+func (txn *txnLeasing) gatherOps(resp *server.ResponseOp, myOps []v3.Op) []v3.Op {
+	allOps := make([]v3.Op, 0)
+	if len(myOps) == 0 {
+		return allOps
+	}
+	for i := range myOps {
+		if !myOps[i].IsTxn() {
+			allOps = append(allOps, myOps[i])
+		}
+		if myOps[i].IsTxn() {
+			_, thenOps, elseOps := myOps[i].Txn()
+			if resp.GetResponseTxn().Succeeded {
+				allOps = append(allOps, txn.gatherOps(resp.GetResponseTxn().Responses[i], thenOps)...)
+			} else {
+				allOps = append(allOps, txn.gatherOps(resp.GetResponseTxn().Responses[i], elseOps)...)
+			}
+		}
+	}
+	return allOps
 }
 
 func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
