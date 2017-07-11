@@ -581,6 +581,36 @@ func TestLeasingOwnerPutResponse(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnOwnerGetRange(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyCount := rand.Intn(10) + 1
+	for i := 0; i < keyCount; i++ {
+		k := fmt.Sprintf("k-%d", i)
+		if _, err := clus.Client(0).Put(context.TODO(), k, k+k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := lkv.Get(context.TODO(), "k-"); err != nil {
+		t.Fatal(err)
+	}
+
+	tresp, terr := lkv.Txn(context.TODO()).Then(clientv3.OpGet("k-", clientv3.WithPrefix())).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if resp := tresp.Responses[0].GetResponseRange(); len(resp.Kvs) != keyCount {
+		t.Fatalf("expected %d keys, got response %+v", keyCount, resp.Kvs)
+	}
+}
+
 func TestLeasingTxnOwnerGet(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
@@ -1085,7 +1115,66 @@ func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	}
 }
 
-func TestLeasingDeleteRangeContend(t *testing.T) {
+func TestLeasingDeleteRangeBounds(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	delkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range []string{"j", "m"} {
+		if _, err := clus.Client(0).Put(context.TODO(), k, "123"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := getkv.Get(context.TODO(), k); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := delkv.Delete(context.TODO(), "k", clientv3.WithPrefix()); err != nil {
+		t.Fatal(err)
+	}
+
+	// leases still on server?
+	for _, k := range []string{"j", "m"} {
+		resp, err := clus.Client(0).Get(context.TODO(), "0/"+k, clientv3.WithPrefix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Kvs) != 1 {
+			t.Fatalf("expected leasing key, got %+v", resp)
+		}
+	}
+
+	// j and m should still have leases registered since not under k*
+	clus.Members[0].Stop(t)
+
+	if _, err := getkv.Get(context.TODO(), "j"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := getkv.Get(context.TODO(), "m"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeasingDeleteRangeContendTxn(t *testing.T) {
+	then := []clientv3.Op{clientv3.OpDelete("key/", clientv3.WithPrefix())}
+	testLeasingDeleteRangeContend(t, clientv3.OpTxn(nil, then, nil))
+}
+
+func TestingLeaseDeleteRangeContendDel(t *testing.T) {
+	op := clientv3.OpDelete("key/", clientv3.WithPrefix())
+	testLeasingDeleteRangeContend(t, op)
+}
+
+func testLeasingDeleteRangeContend(t *testing.T, op clientv3.Op) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -1120,7 +1209,7 @@ func TestLeasingDeleteRangeContend(t *testing.T) {
 		}
 	}()
 
-	_, delErr := delkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	_, delErr := delkv.Do(context.TODO(), op)
 	cancel()
 	<-donec
 	if delErr != nil {
@@ -1324,6 +1413,63 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 	}
 	if !reflect.DeepEqual(lresp.Kvs, cresp.Kvs) {
 		t.Fatalf("expected %+v, got %+v", cresp, lresp)
+	}
+}
+
+func TestLeasingTxnAtomicCache(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	puts, gets := make([]clientv3.Op, 16), make([]clientv3.Op, 16)
+	for i := range puts {
+		k := fmt.Sprintf("k-%d", i)
+		puts[i], gets[i] = clientv3.OpPut(k, k), clientv3.OpGet(k)
+	}
+	if _, err := clus.Client(0).Txn(context.TODO()).Then(puts...).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range gets {
+		if _, err := lkv.Do(context.TODO(), gets[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	donec := make(chan struct{})
+	go func() {
+		defer close(donec)
+		for i := 0; i < 10; i++ {
+			if _, err := lkv.Txn(context.TODO()).Then(puts...).Commit(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-donec:
+			return
+		default:
+		}
+		tresp, err := lkv.Txn(context.TODO()).Then(gets...).Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		revs := make([]int64, len(gets))
+		for i, resp := range tresp.Responses {
+			rr := resp.GetResponseRange()
+			revs[i] = rr.Kvs[0].ModRevision
+		}
+		for i := 1; i < len(revs); i++ {
+			if revs[i] != revs[i-1] {
+				t.Fatalf("expected matching revisions, got %+v", revs)
+			}
+		}
 	}
 }
 
