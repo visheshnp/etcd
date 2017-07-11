@@ -1085,7 +1085,17 @@ func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	}
 }
 
-func TestLeasingDeleteRangeContend(t *testing.T) {
+func TestLeasingDeleteRangeContendTxn(t *testing.T) {
+	then := []clientv3.Op{clientv3.OpDelete("key/", clientv3.WithPrefix())}
+	testLeasingDeleteRangeContend(t, clientv3.OpTxn(nil, then, nil))
+}
+
+func TestingLeaseDeleteRangeContendDel(t *testing.T) {
+	op := clientv3.OpDelete("key/", clientv3.WithPrefix())
+	testLeasingDeleteRangeContend(t, op)
+}
+
+func testLeasingDeleteRangeContend(t *testing.T, op clientv3.Op) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
@@ -1120,7 +1130,7 @@ func TestLeasingDeleteRangeContend(t *testing.T) {
 		}
 	}()
 
-	_, delErr := delkv.Delete(context.TODO(), "key/", clientv3.WithPrefix())
+	_, delErr := delkv.Do(context.TODO(), op)
 	cancel()
 	<-donec
 	if delErr != nil {
