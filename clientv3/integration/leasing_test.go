@@ -1416,6 +1416,63 @@ func TestLeasingReconnectOwnerConsistency(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnAtomicCache(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	puts, gets := make([]clientv3.Op, 16), make([]clientv3.Op, 16)
+	for i := range puts {
+		k := fmt.Sprintf("k-%d", i)
+		puts[i], gets[i] = clientv3.OpPut(k, k), clientv3.OpGet(k)
+	}
+	if _, err := clus.Client(0).Txn(context.TODO()).Then(puts...).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range gets {
+		if _, err := lkv.Do(context.TODO(), gets[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	donec := make(chan struct{})
+	go func() {
+		defer close(donec)
+		for i := 0; i < 10; i++ {
+			if _, err := lkv.Txn(context.TODO()).Then(puts...).Commit(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-donec:
+			return
+		default:
+		}
+		tresp, err := lkv.Txn(context.TODO()).Then(gets...).Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		revs := make([]int64, len(gets))
+		for i, resp := range tresp.Responses {
+			rr := resp.GetResponseRange()
+			revs[i] = rr.Kvs[0].ModRevision
+		}
+		for i := 1; i < len(revs); i++ {
+			if revs[i] != revs[i-1] {
+				t.Fatalf("expected matching revisions, got %+v", revs)
+			}
+		}
+	}
+}
+
 // TestLeasingReconnectTxn checks that txns are resilient to disconnects.
 func TestLeasingReconnectTxn(t *testing.T) {
 	defer testutil.AfterTest(t)
