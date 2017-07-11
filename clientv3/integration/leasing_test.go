@@ -581,6 +581,36 @@ func TestLeasingOwnerPutResponse(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnOwnerGetRange(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "pfx/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyCount := rand.Intn(10) + 1
+	for i := 0; i < keyCount; i++ {
+		k := fmt.Sprintf("k-%d", i)
+		if _, err := clus.Client(0).Put(context.TODO(), k, k+k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := lkv.Get(context.TODO(), "k-"); err != nil {
+		t.Fatal(err)
+	}
+
+	tresp, terr := lkv.Txn(context.TODO()).Then(clientv3.OpGet("k-", clientv3.WithPrefix())).Commit()
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if resp := tresp.Responses[0].GetResponseRange(); len(resp.Kvs) != keyCount {
+		t.Fatalf("expected %d keys, got response %+v", keyCount, resp.Kvs)
+	}
+}
+
 func TestLeasingTxnOwnerGet(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
