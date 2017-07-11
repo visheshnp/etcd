@@ -151,6 +151,9 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
 		li := txn.lkv.leases.inCache(key)
+		if len(string(opArray[i].RangeBytes())) > 0 {
+			return responseArray, false
+		}
 		if li != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
 				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key,
