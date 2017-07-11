@@ -1115,6 +1115,55 @@ func testLeasingOwnerDelete(t *testing.T, del clientv3.Op) {
 	}
 }
 
+func TestLeasingDeleteRangeBounds(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	delkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getkv, err := leasing.NewleasingKV(clus.Client(0), "0/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range []string{"j", "m"} {
+		if _, err := clus.Client(0).Put(context.TODO(), k, "123"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := getkv.Get(context.TODO(), k); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := delkv.Delete(context.TODO(), "k", clientv3.WithPrefix()); err != nil {
+		t.Fatal(err)
+	}
+
+	// leases still on server?
+	for _, k := range []string{"j", "m"} {
+		resp, err := clus.Client(0).Get(context.TODO(), "0/"+k, clientv3.WithPrefix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Kvs) != 1 {
+			t.Fatalf("expected leasing key, got %+v", resp)
+		}
+	}
+
+	// j and m should still have leases registered since not under k*
+	clus.Members[0].Stop(t)
+
+	if _, err := getkv.Get(context.TODO(), "j"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := getkv.Get(context.TODO(), "m"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLeasingDeleteRangeContendTxn(t *testing.T) {
 	then := []clientv3.Op{clientv3.OpDelete("key/", clientv3.WithPrefix())}
 	testLeasingDeleteRangeContend(t, clientv3.OpTxn(nil, then, nil))
