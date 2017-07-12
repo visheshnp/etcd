@@ -1440,37 +1440,57 @@ func TestLeasingTxnAtomicCache(t *testing.T) {
 		}
 	}
 
-	donec := make(chan struct{})
-	go func() {
-		defer close(donec)
+	numPutters, numGetters := 16, 16
+
+	var wgPutters, wgGetters sync.WaitGroup
+	wgPutters.Add(numPutters)
+	wgGetters.Add(numGetters)
+
+	f := func() {
+		defer wgPutters.Done()
 		for i := 0; i < 10; i++ {
 			if _, err := lkv.Txn(context.TODO()).Then(puts...).Commit(); err != nil {
 				t.Fatal(err)
 			}
 		}
-	}()
+	}
 
-	for {
-		select {
-		case <-donec:
-			return
-		default:
-		}
-		tresp, err := lkv.Txn(context.TODO()).Then(gets...).Commit()
-		if err != nil {
-			t.Fatal(err)
-		}
-		revs := make([]int64, len(gets))
-		for i, resp := range tresp.Responses {
-			rr := resp.GetResponseRange()
-			revs[i] = rr.Kvs[0].ModRevision
-		}
-		for i := 1; i < len(revs); i++ {
-			if revs[i] != revs[i-1] {
-				t.Fatalf("expected matching revisions, got %+v", revs)
+	donec := make(chan struct{}, numPutters)
+	g := func() {
+		defer wgGetters.Done()
+		for {
+			select {
+			case <-donec:
+				return
+			default:
+			}
+			tresp, err := lkv.Txn(context.TODO()).Then(gets...).Commit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			revs := make([]int64, len(gets))
+			for i, resp := range tresp.Responses {
+				rr := resp.GetResponseRange()
+				revs[i] = rr.Kvs[0].ModRevision
+			}
+			for i := 1; i < len(revs); i++ {
+				if revs[i] != revs[i-1] {
+					t.Fatalf("expected matching revisions, got %+v", revs)
+				}
 			}
 		}
 	}
+
+	for i := 0; i < numGetters; i++ {
+		go g()
+	}
+	for i := 0; i < numPutters; i++ {
+		go f()
+	}
+
+	wgPutters.Wait()
+	close(donec)
+	wgGetters.Wait()
 }
 
 // TestLeasingReconnectTxn checks that txns are resilient to disconnects.
