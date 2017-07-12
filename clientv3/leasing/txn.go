@@ -6,7 +6,6 @@ import (
 
 	v3 "github.com/coreos/etcd/clientv3"
 	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
 func compareInt64(a, b int64) int {
@@ -22,6 +21,11 @@ func compareInt64(a, b int64) int {
 
 func (txn *txnLeasing) allCmpsfromCache() (bool, bool) {
 	serverTxnBool, cacheBool, cacheCount := false, true, 0
+	for _, cmp := range txn.cs {
+		if len(string(cmp.RangeEnd)) > 0 {
+			return false, true
+		}
+	}
 	if txn.cs != nil {
 		for itr := range txn.cs {
 			if li := txn.lkv.leases.inCache(string(txn.cs[itr].Key)); li != nil {
@@ -236,23 +240,28 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
-
 		temp = txn.gatherOps(txnResp.Responses[0], txn.opst)
 	}
 	if !txnResp.Succeeded && len(txn.opse) != 0 {
 		temp = txn.gatherOps(txnResp.Responses[0], txn.opse)
 	}
-
+	txn.lkv.leases.mu.Lock()
 	for i := range temp {
-		key := string(temp[i].KeyBytes())
-		li := txn.lkv.leases.inCache(key)
+		li := txn.lkv.leases.entries[string(temp[i].KeyBytes())]
 		if li != nil && temp[i].IsPut() {
-			txn.lkv.leases.updateCacheValue(key, string(temp[i].ValueBytes()), txnResp.Header)
+			liResp := li.response
+			if liResp.Kvs[0].ModRevision < txnResp.Header.Revision {
+				liResp.Header = txnResp.Header
+				liResp.Kvs[0].ModRevision = txnResp.Header.Revision
+				liResp.Kvs[0].Value = temp[i].ValueBytes()
+			}
+			liResp.Kvs[0].Version++
 		}
 		if li != nil && temp[i].IsDelete() {
-			txn.lkv.deleteKey(txn.ctx, key, v3.OpDelete(txn.lkv.pfx+key))
+			delete(txn.lkv.leases.entries, string(temp[i].KeyBytes())) // delete lk also?
 		}
 	}
+	txn.lkv.leases.mu.Unlock()
 }
 
 func (txn *txnLeasing) gatherOps(resp *server.ResponseOp, myOps []v3.Op) []v3.Op {
@@ -311,32 +320,6 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 		}
 	}
 	return nil
-}
-
-func (lc *leaseCache) updateCacheValue(key, val string, respHeader *server.ResponseHeader) {
-	var wc chan struct{}
-	lc.mu.Lock()
-	lc.entries[key].waitc = make(chan struct{})
-	wc = lc.entries[key].waitc
-	mapResp := lc.entries[key].response
-	if len(mapResp.Kvs) == 0 {
-		myKV := &mvccpb.KeyValue{
-			Value:   []byte(val),
-			Key:     []byte(key),
-			Version: 0,
-		}
-		mapResp.Kvs, mapResp.More, mapResp.Count = append(mapResp.Kvs, myKV), false, 1
-		mapResp.Kvs[0].CreateRevision = respHeader.Revision
-	}
-	if len(mapResp.Kvs) > 0 {
-		if mapResp.Kvs[0].ModRevision < respHeader.Revision {
-			mapResp.Header, mapResp.Kvs[0].Value = respHeader, []byte(val)
-			mapResp.Kvs[0].ModRevision = respHeader.Revision
-		}
-		mapResp.Kvs[0].Version++
-	}
-	lc.mu.Unlock()
-	close(wc)
 }
 
 const (

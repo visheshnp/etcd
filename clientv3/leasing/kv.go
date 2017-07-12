@@ -491,43 +491,45 @@ func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v
 		fmt.Println("start")
 		endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(lkv.pfx+key)
 		var wc [](chan struct{})
-		getResp, err := lkv.kv.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
+		getResp, err := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
 		//fmt.Println("getResp", getResp)
 		if err != nil {
 			return nil, err
 		}
-		lkv.leases.mu.Lock()
-		fmt.Println("lkv", lkv)
-		lkv.leases.mu.Unlock()
 
 		for i := range getResp.Kvs {
-			lkey := string(getResp.Kvs[i].Key)
-			if _, ok := lkv.leases.entries[strings.TrimPrefix(lkey, lkv.pfx)]; !ok {
-				txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkey), "=", 0))
-				txn1 = txn1.Then(v3.OpPut(lkey, "", v3.WithLease(lkv.leaseID())))
-				txn1 = txn1.Else(v3.OpPut(lkey, "REVOKE", v3.WithIgnoreLease()))
+			gkey := string(getResp.Kvs[i].Key)
+			if _, ok := lkv.leases.entries[gkey]; !ok {
+				txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+gkey), "=", 0))
+				txn1 = txn1.Then(v3.OpPut(lkv.pfx+gkey, "", v3.WithLease(lkv.leaseID())))
+				txn1 = txn1.Else(v3.OpPut(lkv.pfx+gkey, "REVOKE", v3.WithIgnoreLease()))
 				revokeResp, err := txn1.Commit()
 				if err != nil {
 					return nil, err
 				}
 				if !revokeResp.Succeeded {
-					lkv.watchforLKDel(ctx, strings.TrimPrefix(lkey, lkv.pfx), revokeResp.Header.Revision)
+					lkv.watchforLKDel(ctx, gkey, revokeResp.Header.Revision)
 				}
-				acqResp, err = lkv.acquireLease(ctx, strings.TrimPrefix(lkey, lkv.pfx), v3.OpGet(strings.TrimPrefix(lkey, lkv.pfx)))
+				acqResp, err = lkv.acquireLease(ctx, gkey, v3.OpGet(gkey))
 				if err != nil {
 					return nil, err
 				}
-				wc = append(wc, lkv.allocateChannel(acqResp, strings.TrimPrefix(lkey, lkv.pfx)))
+				wc = append(wc, lkv.allocateChannel(acqResp, gkey))
 			}
 		}
+
+		lkv.leases.mu.Lock()
+		fmt.Println("lkv after acquire", lkv)
+		lkv.leases.mu.Unlock()
+
 		getresp, _ := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
 		fmt.Println("getresp", getresp)
 		maxRev = maxRevision(getresp, mod)
 		fmt.Println("maxModRev", maxRev)
 
-		// /lkvresp, _ := lkv.cl.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
-		//fmt.Println("lkresp", lkvresp)
-		maxRevlk := maxRevision(getResp, create)
+		lkvresp, _ := lkv.cl.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
+		fmt.Println("lkresp", lkvresp)
+		maxRevlk := maxRevision(lkvresp, create)
 		fmt.Println("maxCreateRevlk", maxRevlk)
 
 		txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.ModRevision(key).WithRange(endKey), "<", maxRev+1),
@@ -631,64 +633,72 @@ func (txn *txnLeasing) Else(ops ...v3.Op) v3.Txn {
 }
 
 func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
-	var txnResp *v3.TxnResponse
-	cacheBool, serverTxnBool := txn.allCmpsfromCache()
-	if !serverTxnBool {
-		opArray := txn.gatherAllOps(txn.defOpArray(cacheBool))
-		if ok, txnResp, err := txn.noOps(opArray, cacheBool); ok {
+	for txn.ctx.Err() == nil {
+		var txnResp *v3.TxnResponse
+		cacheBool, serverTxnBool := txn.allCmpsfromCache()
+		if !serverTxnBool {
+			opArray := txn.gatherAllOps(txn.defOpArray(cacheBool))
+			if ok, txnResp, err := txn.noOps(opArray, cacheBool); ok {
+				if err != nil {
+					return nil, err
+				}
+				return txnResp, nil
+			}
+			for _, ch := range txn.lkv.leases.blockKeys(opArray, waitReleaseChan) {
+				select {
+				case <-ch:
+				case <-txn.ctx.Done():
+					return nil, txn.ctx.Err()
+				}
+			}
+			txn.lkv.leases.mu.Lock()
+			responseArray, ok := txn.cacheOpArray(opArray)
+
+			if ok {
+				//	if txn.lkv.checkOpenChannel() {
+				txn.lkv.leases.mu.Unlock()
+				cacheResp, _ := txn.lkv.allInCache(responseArray, cacheBool)
+				return cacheResp, nil
+				//}
+			}
+			// /txn.lkv.leases.mu.Unlock()
+			//return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
+
+			txn.lkv.leases.mu.Unlock()
+			serverTxnBool = !serverTxnBool
+		}
+		<-txn.lkv.sessionc
+		allOps := append(txn.opst, txn.opse...)
+		txnOps := txn.gatherAllOps(allOps)
+		wcs := txn.lkv.leases.blockKeys(txnOps, acquireChan)
+		for {
+			elseOps, cmps := txn.cmpUpdate(txnOps)
+			resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
+			if err != nil {
+				for i := range cmps {
+					key := string(cmps[i].Key)
+					if txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)) != nil {
+						txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(key, txn.lkv.pfx))
+					}
+				}
+				return nil, err
+			}
+			if resp.Succeeded {
+				txnResp = txn.extractResp(resp)
+				txn.modifyCacheTxn(txnResp)
+				for _, wc := range wcs {
+					close(wc)
+				}
+				break
+			}
+			err = txn.NonOwnerRevoke(resp, elseOps, txnOps)
 			if err != nil {
 				return nil, err
 			}
-			return txnResp, nil
 		}
-		for _, ch := range txn.lkv.leases.blockKeys(opArray, waitReleaseChan) {
-			select {
-			case <-ch:
-			case <-txn.ctx.Done():
-				return nil, txn.ctx.Err()
-			}
-		}
-		txn.lkv.leases.mu.Lock()
-		responseArray, ok := txn.cacheOpArray(opArray)
-		txn.lkv.leases.mu.Unlock()
-		if ok {
-			if txn.lkv.checkOpenChannel() {
-				return txn.lkv.allInCache(responseArray, cacheBool)
-			}
-			return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
-		}
-		serverTxnBool = !serverTxnBool
+		return txnResp, nil
 	}
-	<-txn.lkv.sessionc
-	allOps := append(txn.opst, txn.opse...)
-	txnOps := txn.gatherAllOps(allOps)
-	wcs := txn.lkv.leases.blockKeys(txnOps, acquireChan)
-	for {
-		elseOps, cmps := txn.cmpUpdate(txnOps)
-		resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
-		if err != nil {
-			for i := range cmps {
-				key := string(cmps[i].Key)
-				if txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)) != nil {
-					txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(key, txn.lkv.pfx))
-				}
-			}
-			return nil, err
-		}
-		if resp.Succeeded {
-			txnResp = txn.extractResp(resp)
-			txn.modifyCacheTxn(txnResp)
-			for _, wc := range wcs {
-				close(wc)
-			}
-			break
-		}
-		err = txn.NonOwnerRevoke(resp, elseOps, txnOps)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return txnResp, nil
+	return nil, txn.ctx.Err()
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
