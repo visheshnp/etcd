@@ -2,7 +2,6 @@ package leasing
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -150,14 +149,12 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 	respOp, responseArray, opCount := &server.ResponseOp{}, make([]*server.ResponseOp, len(opArray)), 0
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
-		li := txn.lkv.leases.inCache(key)
 		if len(string(opArray[i].RangeBytes())) > 0 {
 			return responseArray, false
 		}
-		if li != nil && opArray[i].IsGet() {
+		if txn.lkv.leases.entries[key] != nil && opArray[i].IsGet() {
 			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.getCachedCopy(txn.ctx, key,
-					v3.OpGet(key)))},
+				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.entries[key].response)},
 			}
 			responseArray[i] = respOp
 			opCount++
@@ -191,7 +188,6 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
 }
 
 func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
-	lkv.leases.mu.Lock()
 	resp := (*v3.GetResponse)(responseArray[0].GetResponseRange())
 	respHeader := &server.ResponseHeader{
 		ClusterId: resp.Header.ClusterId,
@@ -199,7 +195,6 @@ func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar boo
 		MemberId:  resp.Header.MemberId,
 		RaftTerm:  resp.Header.RaftTerm,
 	}
-	lkv.leases.mu.Unlock()
 	return &v3.TxnResponse{
 		Header:    respHeader,
 		Succeeded: boolvar,
@@ -241,7 +236,7 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
-		fmt.Println(txnResp.Responses[0])
+
 		temp = txn.gatherOps(txnResp.Responses[0], txn.opst)
 	}
 	if !txnResp.Succeeded && len(txn.opse) != 0 {
@@ -321,7 +316,6 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 func (lc *leaseCache) updateCacheValue(key, val string, respHeader *server.ResponseHeader) {
 	var wc chan struct{}
 	lc.mu.Lock()
-	defer lc.mu.Unlock()
 	lc.entries[key].waitc = make(chan struct{})
 	wc = lc.entries[key].waitc
 	mapResp := lc.entries[key].response
@@ -341,5 +335,40 @@ func (lc *leaseCache) updateCacheValue(key, val string, respHeader *server.Respo
 		}
 		mapResp.Kvs[0].Version++
 	}
+	lc.mu.Unlock()
 	close(wc)
+}
+
+const (
+	acquireChan     int = 1
+	waitReleaseChan int = 2
+)
+
+func (lc *leaseCache) blockKeys(ops []v3.Op, chanModify int) []chan struct{} {
+	var wcs [](chan struct{})
+	lc.mu.Lock()
+	switch chanModify {
+	case waitReleaseChan:
+		for _, op := range ops {
+			key := string(op.KeyBytes())
+			li := lc.entries[key]
+			if li != nil && op.IsGet() {
+				wcs = append(wcs, li.waitc)
+			}
+		}
+	case acquireChan:
+		for _, op := range ops {
+			if op.IsPut() || op.IsDelete() {
+				key := string(op.KeyBytes())
+				li := lc.entries[key]
+				if li != nil {
+					li.waitc = make(chan struct{})
+					wcs = append(wcs, li.waitc)
+				}
+			}
+		}
+
+	}
+	lc.mu.Unlock()
+	return wcs
 }
