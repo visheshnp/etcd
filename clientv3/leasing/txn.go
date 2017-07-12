@@ -6,6 +6,7 @@ import (
 
 	v3 "github.com/coreos/etcd/clientv3"
 	server "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
 func compareInt64(a, b int64) int {
@@ -251,11 +252,25 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 		if li != nil && temp[i].IsPut() {
 			liResp := li.response
 			if liResp.Kvs[0].ModRevision < txnResp.Header.Revision {
-				liResp.Header = txnResp.Header
-				liResp.Kvs[0].ModRevision = txnResp.Header.Revision
-				liResp.Kvs[0].Value = temp[i].ValueBytes()
+				kvs := []*mvccpb.KeyValue{
+					&mvccpb.KeyValue{
+						Key:            temp[i].KeyBytes(),
+						CreateRevision: liResp.Kvs[0].CreateRevision,
+						ModRevision:    txnResp.Header.Revision,
+						Version:        liResp.Kvs[0].Version,
+						Value:          temp[i].ValueBytes(),
+						Lease:          liResp.Kvs[0].Lease,
+					},
+				}
+				liResp = &v3.GetResponse{
+					Header: respHeaderPopulate(txnResp.Header),
+					Kvs:    kvs,
+					More:   liResp.More,
+					Count:  liResp.Count,
+				}
 			}
 			liResp.Kvs[0].Version++
+			li.response = liResp
 		}
 		if li != nil && temp[i].IsDelete() {
 			delete(txn.lkv.leases.entries, string(temp[i].KeyBytes())) // delete lk also?
