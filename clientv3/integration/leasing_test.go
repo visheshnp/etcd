@@ -1561,6 +1561,42 @@ func TestLeasingReconnectNonOwnerGet(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnRangeCmp(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "a"); err != nil {
+		t.Fatal(err)
+	}
+	// k2 version = 2
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "a"); err != nil {
+		t.Fatal(err)
+	}
+
+	// cache k
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	cmp := clientv3.Compare(clientv3.Version("k").WithPrefix(), "=", 1)
+	tresp, terr := lkv.Txn(context.TODO()).If(cmp).Commit()
+	if terr != nil {
+		t.Fatal(err)
+	}
+	if tresp.Succeeded {
+		t.Fatal("expected Succeeded=false, got %+v", tresp)
+	}
+}
+
 func TestLeasingDo(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
