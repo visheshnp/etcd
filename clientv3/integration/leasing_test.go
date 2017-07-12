@@ -1561,6 +1561,42 @@ func TestLeasingReconnectNonOwnerGet(t *testing.T) {
 	}
 }
 
+func TestLeasingTxnRangeCmp(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	lkv, err := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clus.Client(0).Put(context.TODO(), "k", "a"); err != nil {
+		t.Fatal(err)
+	}
+	// k2 version = 2
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clus.Client(0).Put(context.TODO(), "k2", "a"); err != nil {
+		t.Fatal(err)
+	}
+
+	// cache k
+	if _, err := lkv.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	cmp := clientv3.Compare(clientv3.Version("k").WithPrefix(), "=", 1)
+	tresp, terr := lkv.Txn(context.TODO()).If(cmp).Commit()
+	if terr != nil {
+		t.Fatal(err)
+	}
+	if tresp.Succeeded {
+		t.Fatal("expected Succeeded=false, got %+v", tresp)
+	}
+}
+
 func TestLeasingDo(t *testing.T) {
 	defer testutil.AfterTest(t)
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
@@ -1720,16 +1756,8 @@ func TestLeasingSessionExpire(t *testing.T) {
 
 	// down endpoint lkv uses for keepalives
 	clus.Members[0].Stop(t)
-	for {
-		time.Sleep(1 * time.Second)
-		resp, err := clus.Client(1).Get(context.TODO(), "foo/abc", clientv3.WithPrefix())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(resp.Kvs) == 0 {
-			// server expired the leasing key
-			break
-		}
+	if err := waitForLeasingExpire(clus.Client(1), "foo/abc"); err != nil {
+		t.Fatal(err)
 	}
 	clus.Members[0].Restart(t)
 
@@ -1751,41 +1779,83 @@ func TestLeasingSessionExpireCancel(t *testing.T) {
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
-	lkv, err := leasing.NewleasingKVTTL(clus.Client(0), "foo/", 1)
-	if err != nil {
-		t.Fatal(err)
+	tests := []func(context.Context, clientv3.KV) error{
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Get(ctx, "abc")
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Delete(ctx, "abc")
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Put(ctx, "abc", "v")
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Txn(ctx).Then(clientv3.OpGet("abc")).Commit()
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Do(ctx, clientv3.OpPut("abc", "v"))
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Do(ctx, clientv3.OpDelete("abc"))
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			_, err := kv.Do(ctx, clientv3.OpGet("abc"))
+			return err
+		},
+		func(ctx context.Context, kv clientv3.KV) error {
+			op := clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpGet("abc")}, nil)
+			_, err := kv.Do(ctx, op)
+			return err
+		},
 	}
-	if _, err := lkv.Get(context.TODO(), "abc"); err != nil {
-		t.Fatal(err)
-	}
-
-	// down endpoint lkv uses for keepalives
-	clus.Members[0].Stop(t)
-	for {
-		time.Sleep(1 * time.Second)
-		resp, err := clus.Client(1).Get(context.TODO(), "foo/abc", clientv3.WithPrefix())
+	for i := range tests {
+		lkv, err := leasing.NewleasingKVTTL(clus.Client(0), "foo/", 1)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := lkv.Get(context.TODO(), "abc"); err != nil {
+			t.Fatal(err)
+		}
+
+		// down endpoint lkv uses for keepalives
+		clus.Members[0].Stop(t)
+		if err := waitForLeasingExpire(clus.Client(1), "foo/abc"); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.TODO())
+		errc := make(chan error, 1)
+		go func() { errc <- tests[i](ctx, lkv) }()
+		cancel()
+
+		select {
+		case err := <-errc:
+			if err != ctx.Err() {
+				t.Errorf("expected %v, got %v", ctx.Err(), err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for get to cancel")
+		}
+		clus.Members[0].Restart(t)
+	}
+}
+
+func waitForLeasingExpire(kv clientv3.KV, lkey string) error {
+	for {
+		time.Sleep(1 * time.Second)
+		resp, err := kv.Get(context.TODO(), lkey, clientv3.WithPrefix())
+		if err != nil {
+			return err
+		}
 		if len(resp.Kvs) == 0 {
 			// server expired the leasing key
-			break
+			return nil
 		}
-	}
-
-	ctx, cancel := context.WithCancel(context.TODO())
-	errc := make(chan error, 1)
-	go func() {
-		_, err := lkv.Get(ctx, "abc")
-		errc <- err
-	}()
-	cancel()
-	select {
-	case err := <-errc:
-		if err != ctx.Err() {
-			t.Fatalf("expected %v, got %v", ctx.Err(), err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for get to cancel")
 	}
 }
