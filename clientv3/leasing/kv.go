@@ -653,18 +653,14 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 			}
 			txn.lkv.leases.mu.Lock()
 			responseArray, ok := txn.cacheOpArray(opArray)
-
-			if ok {
-				//	if txn.lkv.checkOpenChannel() {
-				txn.lkv.leases.mu.Unlock()
-				cacheResp, _ := txn.lkv.allInCache(responseArray, cacheBool)
-				return cacheResp, nil
-				//}
-			}
-			// /txn.lkv.leases.mu.Unlock()
-			//return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
-
 			txn.lkv.leases.mu.Unlock()
+			if ok {
+				if txn.lkv.checkOpenChannel() {
+					cacheResp, _ := txn.lkv.allInCache(responseArray, cacheBool)
+					return cacheResp, nil
+				}
+				return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
+			}
 			serverTxnBool = !serverTxnBool
 		}
 		<-txn.lkv.sessionc
