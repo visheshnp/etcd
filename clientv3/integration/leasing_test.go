@@ -1779,6 +1779,7 @@ func TestLeasingSessionExpire(t *testing.T) {
 	if err := waitForLeasingExpire(clus.Client(1), "foo/abc"); err != nil {
 		t.Fatal(err)
 	}
+	waitForExpireAck(t, lkv)
 	clus.Members[0].Restart(t)
 
 	if _, err = lkv2.Put(context.TODO(), "abc", "def"); err != nil {
@@ -1848,19 +1849,22 @@ func TestLeasingSessionExpireCancel(t *testing.T) {
 		if err := waitForLeasingExpire(clus.Client(1), "foo/abc"); err != nil {
 			t.Fatal(err)
 		}
+		waitForExpireAck(t, lkv)
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		errc := make(chan error, 1)
 		go func() { errc <- tests[i](ctx, lkv) }()
+		// some delay to get past for ctx.Err() != nil {} loops
+		time.Sleep(100 * time.Millisecond)
 		cancel()
 
 		select {
 		case err := <-errc:
 			if err != ctx.Err() {
-				t.Errorf("expected %v, got %v", ctx.Err(), err)
+				t.Errorf("#%d: expected %v, got %v", i, ctx.Err(), err)
 			}
 		case <-time.After(5 * time.Second):
-			t.Errorf("timed out waiting for get to cancel")
+			t.Errorf("#%d: timed out waiting for cancel", i)
 		}
 		clus.Members[0].Restart(t)
 	}
@@ -1878,4 +1882,18 @@ func waitForLeasingExpire(kv clientv3.KV, lkey string) error {
 			return nil
 		}
 	}
+}
+
+func waitForExpireAck(t *testing.T, kv clientv3.KV) {
+	// wait for leasing client to acknowledge lost lease
+	for i := 0; i < 10; i++ {
+		ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+		_, err := kv.Get(ctx, "abc")
+		cancel()
+		if err == ctx.Err() {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("waited too long to acknlowedge lease expiration")
 }
