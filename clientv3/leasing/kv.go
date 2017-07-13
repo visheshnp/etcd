@@ -15,9 +15,9 @@
 package leasing
 
 import (
-	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	v3 "github.com/coreos/etcd/clientv3"
 	concurrency "github.com/coreos/etcd/clientv3/concurrency"
@@ -40,8 +40,10 @@ type leasingKV struct {
 }
 
 type leaseCache struct {
-	entries map[string]*leaseInfo
-	mu      sync.Mutex
+	monitorRevocation map[string]time.Time
+	entries           map[string]*leaseInfo
+	mu                sync.Mutex
+	flag              int
 }
 
 type leaseInfo struct {
@@ -59,7 +61,7 @@ func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
 	sessionc := make(chan struct{})
 	close(sessionc)
 	cctx, cancel := context.WithCancel(cl.Ctx())
-	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
+	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{monitorRevocation: make(map[string]time.Time), entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
 	go kv.monitorSession(cl, 0)
 	return &kv, nil
 }
@@ -73,8 +75,7 @@ func NewleasingKVTTL(cl *v3.Client, leasingprefix string, ttl int) (v3.KV, error
 	sessionc := make(chan struct{})
 	close(sessionc)
 	cctx, cancel := context.WithCancel(cl.Ctx())
-	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
-	go kv.monitorSession(cl, ttl)
+	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{monitorRevocation: make(map[string]time.Time), entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
 	return &kv, nil
 }
 
@@ -249,27 +250,25 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 	return r.Put(), nil
 }
 
+const (
+	revocationDur int = 2
+)
+
 func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
-	//var wc chan struct{}
 	nCtx, cancel := context.WithCancel(lkv.ctx)
 	defer cancel()
 	for nCtx.Err() == nil {
-		/*	if li := lkv.leases.inCache(key); li != nil {
-			lkv.leases.mu.Lock()
-			li.waitc = make(chan struct{})
-			wc = li.waitc
-			lkv.leases.mu.Unlock()
-		}*/
 		wch := lkv.cl.Watch(nCtx, lkv.pfx+key, v3.WithRev(resp.Header.Revision+1))
 		for resp := range wch {
 			for _, ev := range resp.Events {
 				if string(ev.Kv.Value) == "REVOKE" {
+					lkv.leases.mu.Lock()
+					lkv.leases.monitorRevocation[key] = time.Now().Local().Add(time.Second * time.Duration(revocationDur))
+					lkv.leases.mu.Unlock()
 					txn := lkv.kv.Txn(nCtx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev)).Then(v3.OpDelete(lkv.pfx + key))
 					delResp, err := txn.Commit()
 					if delResp.Succeeded {
 						lkv.leases.deleteKeyInCache(key)
-						fmt.Println("deleted", key)
-						//	close(wc)
 						return
 					}
 					if err != nil || !delResp.Succeeded {
@@ -362,7 +361,7 @@ func (lkv *leasingKV) leaseID() v3.LeaseID {
 	return lkv.session.Lease()
 }
 
-func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*v3.TxnResponse, error) {
+func (lkv *leasingKV) acquireLeaseRPC(ctx context.Context, key string, op v3.Op) (*v3.TxnResponse, error) {
 	txn := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
 	txn = txn.Then((op), v3.OpPut(lkv.pfx+key, "", v3.WithLease(lkv.leaseID())))
 	txn = txn.Else(op)
@@ -371,6 +370,27 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 		return nil, err
 	}
 	return resp, nil
+}
+
+func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*v3.TxnResponse, error) {
+	lkv.leases.mu.Lock()
+	lr, ok := lkv.leases.monitorRevocation[key]
+	lkv.leases.mu.Unlock()
+	if ok {
+		timeElasped := lr.Minute()*60 + lr.Second()
+		currTime := time.Now().Local().Minute()*60 + (time.Now().Local().Second())
+		if timeElasped < currTime {
+			return lkv.acquireLeaseRPC(ctx, key, op)
+		}
+		resp, err := lkv.kv.Txn(ctx).Then(op).Commit()
+		txnResp := &v3.TxnResponse{
+			Header:    respHeaderPopulate(resp.Header),
+			Succeeded: false,
+			Responses: []*server.ResponseOp{(resp.Responses[0])},
+		}
+		return txnResp, err
+	}
+	return lkv.acquireLeaseRPC(ctx, key, op)
 }
 
 func (lkv *leasingKV) get(ctx context.Context, key string, op v3.Op) (*v3.GetResponse, error) {
@@ -382,9 +402,7 @@ func (lkv *leasingKV) get(ctx context.Context, key string, op v3.Op) (*v3.GetRes
 	if op.IsSerializable() {
 		return lkv.kv.Get(ctx, key, v3.WithSerializable())
 	}
-	//fmt.Println("server rpc acquireLease")
 	resp, err := lkv.acquireLease(ctx, key, op)
-	//	fmt.Println("resp", resp)
 	if err != nil {
 		return nil, err
 	}
@@ -449,12 +467,8 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, op v3.Op) (*v3.
 	return delResp, nil
 }
 
-func (lkv *leasingKV) allocateChannel(txnResp *v3.TxnResponse, key string) chan struct{} {
-	getResp := (*v3.GetResponse)(txnResp.Responses[0].GetResponseRange())
-	getResp.Header = respHeaderPopulate(txnResp.Header)
+func (lkv *leasingKV) allocateChannel(key string) chan struct{} {
 	lkv.leases.mu.Lock()
-	lkv.leases.entries[key] = &leaseInfo{response: getResp,
-		revision: getResp.Header.Revision}
 	lkv.leases.entries[key].waitc = make(chan struct{})
 	lkv.leases.mu.Unlock()
 	return lkv.leases.entries[key].waitc
@@ -485,56 +499,34 @@ func maxRevision(getResp *v3.GetResponse, revType int) int64 {
 }
 
 func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v3.DeleteResponse, error) {
-	var acqResp *v3.TxnResponse
-	var maxRev int64
 	for ctx.Err() == nil {
-		fmt.Println("start")
 		endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(lkv.pfx+key)
 		var wc [](chan struct{})
 		getResp, err := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
-		//fmt.Println("getResp", getResp)
 		if err != nil {
 			return nil, err
 		}
-
+		getRespLK, err := lkv.kv.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
+		if err != nil {
+			return nil, err
+		}
 		for i := range getResp.Kvs {
 			gkey := string(getResp.Kvs[i].Key)
 			if _, ok := lkv.leases.entries[gkey]; !ok {
-				txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+gkey), "=", 0))
-				txn1 = txn1.Then(v3.OpPut(lkv.pfx+gkey, "", v3.WithLease(lkv.leaseID())))
-				txn1 = txn1.Else(v3.OpPut(lkv.pfx+gkey, "REVOKE", v3.WithIgnoreLease()))
-				revokeResp, err := txn1.Commit()
+				err := lkv.revokeLease(ctx, gkey)
 				if err != nil {
 					return nil, err
 				}
-				if !revokeResp.Succeeded {
-					lkv.watchforLKDel(ctx, gkey, revokeResp.Header.Revision)
-				}
-				acqResp, err = lkv.acquireLease(ctx, gkey, v3.OpGet(gkey))
-				if err != nil {
-					return nil, err
-				}
-				wc = append(wc, lkv.allocateChannel(acqResp, gkey))
+			} else {
+				wc = append(wc, lkv.allocateChannel(gkey))
 			}
 		}
-
-		lkv.leases.mu.Lock()
-		fmt.Println("lkv after acquire", lkv)
-		lkv.leases.mu.Unlock()
-
 		getresp, _ := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
-		fmt.Println("getresp", getresp)
-		maxRev = maxRevision(getresp, mod)
-		fmt.Println("maxModRev", maxRev)
-
-		lkvresp, _ := lkv.cl.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
-		fmt.Println("lkresp", lkvresp)
-		maxRevlk := maxRevision(lkvresp, create)
-		fmt.Println("maxCreateRevlk", maxRevlk)
-
+		maxRev := maxRevision(getresp, mod)
+		maxRevLK := maxRevision(getRespLK, create)
 		txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.ModRevision(key).WithRange(endKey), "<", maxRev+1),
-			v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), "<", maxRevlk+1))
-		txn1 = txn1.Then(v3.OpDelete(key, v3.WithRange(endKey)), v3.OpDelete(lkv.pfx+key, v3.WithRange(leasingendKey)))
+			v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
+		txn1 = txn1.Then(v3.OpDelete(key, v3.WithRange(endKey)))
 		delRangeResp, err := txn1.Commit()
 		if err != nil {
 			for i := range wc {
@@ -548,7 +540,6 @@ func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v
 			}
 			continue
 		}
-		fmt.Println("success")
 		for i := range getResp.Kvs {
 			if _, ok := lkv.leases.entries[string(getResp.Kvs[i].Key)]; ok {
 				lkv.leases.deleteKeyInCache(string(getResp.Kvs[i].Key))
