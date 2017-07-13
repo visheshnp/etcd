@@ -2,6 +2,7 @@ package leasing
 
 import (
 	"bytes"
+	"context"
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -114,16 +115,17 @@ func returnRev(respArray []*server.ResponseOp) int64 {
 	return rev
 }
 
-func (txn *txnLeasing) revokeLease(key string) error {
+func (lkv *leasingKV) revokeLease(ctx context.Context, key string) error {
 	var err error
-	txn1 := txn.lkv.cl.Txn(txn.ctx).If(v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), ">", 0))
-	txn1 = txn1.Then(v3.OpPut(txn.lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
+	txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
+	txn1 = txn1.Then(v3.OpGet(key))
+	txn1 = txn1.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
 	revokeResp, err := txn1.Commit()
 	if err != nil {
 		return err
 	}
-	if revokeResp.Succeeded {
-		txn.lkv.watchforLKDel(txn.ctx, key, revokeResp.Header.Revision)
+	if !revokeResp.Succeeded {
+		lkv.watchforLKDel(ctx, key, revokeResp.Header.Revision)
 	}
 	return err
 }
@@ -330,7 +332,7 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 		key := string(txnOps[i].KeyBytes())
 		if li := txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)); li == nil {
 			if mapResp[key] && (txnOps[i].IsPut() || txnOps[i].IsDelete()) {
-				return txn.revokeLease(key)
+				return txn.lkv.revokeLease(txn.ctx, key)
 			}
 		}
 	}
