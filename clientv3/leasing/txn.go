@@ -30,7 +30,7 @@ func (txn *txnLeasing) allCmpsfromCache() (bool, bool) {
 	}
 	if txn.cs != nil {
 		for itr := range txn.cs {
-			if li := txn.lkv.leases.inCache(string(txn.cs[itr].Key)); li != nil {
+			if li := txn.lkv.leases.checkInCache(string(txn.cs[itr].Key)); li != nil {
 				cacheResp := li.response
 				var result int
 				if len(cacheResp.Kvs) != 0 {
@@ -117,10 +117,8 @@ func returnRev(respArray []*server.ResponseOp) int64 {
 
 func (lkv *leasingKV) revokeLease(ctx context.Context, key string) error {
 	var err error
-	txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0))
-	txn1 = txn1.Then(v3.OpGet(key))
-	txn1 = txn1.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease()))
-	revokeResp, err := txn1.Commit()
+	txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(v3.OpGet(key))
+	revokeResp, err := txn1.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease())).Commit()
 	if err != nil {
 		return err
 	}
@@ -147,7 +145,7 @@ func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResp
 		if err != nil {
 			return noOp, nil, err
 		}
-		return noOp, resp, err
+		return noOp, resp, nil
 	}
 	return noOp, nil, nil
 }
@@ -175,19 +173,17 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
 	var rev int64
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
-		li := txn.lkv.leases.inCache(key)
+		li := txn.lkv.leases.checkInCache(key)
 		if li != nil {
 			rev = li.revision
-		}
-		if li == nil {
+		} else {
 			rev = 0
 		}
 		if opArray[i].IsGet() {
 			continue
 		}
 		if !isPresent[txn.lkv.pfx+key] {
-			cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev))
-			elseOps = append(elseOps, v3.OpGet(txn.lkv.pfx+key))
+			cmps, elseOps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)), append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 			isPresent[txn.lkv.pfx+key] = true
 		}
 	}
@@ -196,14 +192,13 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
 
 func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
 	resp := (*v3.GetResponse)(responseArray[0].GetResponseRange())
-	respHeader := &server.ResponseHeader{
-		ClusterId: resp.Header.ClusterId,
-		Revision:  lkv.header.Revision,
-		MemberId:  resp.Header.MemberId,
-		RaftTerm:  resp.Header.RaftTerm,
-	}
 	return &v3.TxnResponse{
-		Header:    respHeader,
+		Header: &server.ResponseHeader{
+			ClusterId: resp.Header.ClusterId,
+			Revision:  lkv.header.Revision,
+			MemberId:  resp.Header.MemberId,
+			RaftTerm:  resp.Header.RaftTerm,
+		},
 		Succeeded: boolvar,
 		Responses: responseArray,
 	}, nil
@@ -222,15 +217,9 @@ func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
 
 func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 	var txnResp *v3.TxnResponse
-	respHeader, responseArray := &server.ResponseHeader{}, make([]*server.ResponseOp, 0)
+	responseArray := make([]*server.ResponseOp, 0)
 	for i := range resp.Responses[0].GetResponseTxn().Responses {
 		responseArray = append(responseArray, resp.Responses[0].GetResponseTxn().Responses[i])
-	}
-	respHeader.Revision = returnRev(responseArray)
-	respHeader = &server.ResponseHeader{
-		ClusterId: resp.Header.ClusterId,
-		MemberId:  resp.Header.MemberId,
-		RaftTerm:  resp.Header.RaftTerm,
 	}
 	txnResp = &v3.TxnResponse{
 		Header:    resp.Header,
@@ -275,7 +264,7 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 			li.response = liResp
 		}
 		if li != nil && temp[i].IsDelete() {
-			delete(txn.lkv.leases.entries, string(temp[i].KeyBytes())) // delete lk also?
+			delete(txn.lkv.leases.entries, string(temp[i].KeyBytes()))
 		}
 	}
 	txn.lkv.leases.mu.Unlock()
@@ -330,7 +319,7 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 	}
 	for i := range txnOps {
 		key := string(txnOps[i].KeyBytes())
-		if li := txn.lkv.leases.inCache(strings.TrimPrefix(key, txn.lkv.pfx)); li == nil {
+		if li := txn.lkv.leases.checkInCache(strings.TrimPrefix(key, txn.lkv.pfx)); li == nil {
 			if mapResp[key] && (txnOps[i].IsPut() || txnOps[i].IsDelete()) {
 				return txn.lkv.revokeLease(txn.ctx, key)
 			}
