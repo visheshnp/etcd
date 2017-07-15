@@ -23,72 +23,75 @@ func compareInt64(a, b int64) int {
 
 func (txn *txnLeasing) allCmpsfromCache() (bool, bool) {
 	serverTxnBool, cacheBool, cacheCount := false, true, 0
+	if txn.cs == nil {
+		return cacheBool, serverTxnBool
+	}
 	for _, cmp := range txn.cs {
 		if len(string(cmp.RangeEnd)) > 0 {
 			return false, true
 		}
 	}
-	if txn.cs != nil {
-		for itr := range txn.cs {
-			if li := txn.lkv.leases.checkInCache(string(txn.cs[itr].Key)); li != nil {
-				cacheResp := li.response
-				var result int
-				if len(cacheResp.Kvs) != 0 {
-					switch txn.cs[itr].Target {
-					case server.Compare_VALUE:
-						tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_Value)
-						if tv != nil {
-							result = bytes.Compare(cacheResp.Kvs[0].Value, tv.Value)
-						}
-					case server.Compare_CREATE:
-						tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_CreateRevision)
-						if tv != nil {
-							result = compareInt64(cacheResp.Kvs[0].CreateRevision, tv.CreateRevision)
-						}
-					case server.Compare_MOD:
-						tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_ModRevision)
-						if tv != nil {
-							result = compareInt64(cacheResp.Kvs[0].ModRevision, tv.ModRevision)
-						}
-					case server.Compare_VERSION:
-						tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_Version)
-						if tv != nil {
-							result = compareInt64(cacheResp.Kvs[0].Version, tv.Version)
-						}
-					}
+	for itr := range txn.cs {
+		li := txn.lkv.leases.checkInCache(string(txn.cs[itr].Key))
+		if li == nil {
+			return false, true
+		}
+		cacheResp := li.response
+		var result int
+		if len(cacheResp.Kvs) != 0 {
+			switch txn.cs[itr].Target {
+			case server.Compare_VALUE:
+				tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_Value)
+				if tv != nil {
+					result = bytes.Compare(cacheResp.Kvs[0].Value, tv.Value)
 				}
-				resultbool := true
-				switch txn.cs[itr].Result {
-				case server.Compare_EQUAL:
-					if result != 0 {
-						resultbool = false
-						break
-					}
-				case server.Compare_NOT_EQUAL:
-					if result == 0 {
-						resultbool = false
-						break
-					}
-				case server.Compare_GREATER:
-					if result != 1 {
-						resultbool = false
-						break
-					}
-				case server.Compare_LESS:
-					if result != -1 {
-						resultbool = false
-						break
-					}
+			case server.Compare_CREATE:
+				tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_CreateRevision)
+				if tv != nil {
+					result = compareInt64(cacheResp.Kvs[0].CreateRevision, tv.CreateRevision)
 				}
-				if resultbool == false {
-					cacheBool = resultbool
+			case server.Compare_MOD:
+				tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_ModRevision)
+				if tv != nil {
+					result = compareInt64(cacheResp.Kvs[0].ModRevision, tv.ModRevision)
 				}
-				cacheCount++
+			case server.Compare_VERSION:
+				tv, _ := txn.cs[itr].TargetUnion.(*server.Compare_Version)
+				if tv != nil {
+					result = compareInt64(cacheResp.Kvs[0].Version, tv.Version)
+				}
 			}
 		}
-		if len(txn.cs) != cacheCount {
-			serverTxnBool = true
+		resultbool := true
+		switch txn.cs[itr].Result {
+		case server.Compare_EQUAL:
+			if result != 0 {
+				resultbool = false
+				break
+			}
+		case server.Compare_NOT_EQUAL:
+			if result == 0 {
+				resultbool = false
+				break
+			}
+		case server.Compare_GREATER:
+			if result != 1 {
+				resultbool = false
+				break
+			}
+		case server.Compare_LESS:
+			if result != -1 {
+				resultbool = false
+				break
+			}
 		}
+		if resultbool == false {
+			cacheBool = resultbool
+		}
+		cacheCount++
+	}
+	if len(txn.cs) != cacheCount {
+		serverTxnBool = true
 	}
 	return cacheBool, serverTxnBool
 }
@@ -116,7 +119,6 @@ func returnRev(respArray []*server.ResponseOp) int64 {
 }
 
 func (lkv *leasingKV) revokeLease(ctx context.Context, key string) error {
-	var err error
 	txn1 := lkv.cl.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(v3.OpGet(key))
 	revokeResp, err := txn1.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease())).Commit()
 	if err != nil {
@@ -125,16 +127,15 @@ func (lkv *leasingKV) revokeLease(ctx context.Context, key string) error {
 	if !revokeResp.Succeeded {
 		lkv.watchforLKDel(ctx, key, revokeResp.Header.Revision)
 	}
-	return err
+	return nil
 }
 
 func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResponse, error) {
-	var txnResp *v3.TxnResponse
 	noOp := len(opArray) == 0
 	if noOp {
 		if txn.lkv.header != nil {
 			txn.lkv.leases.mu.Lock()
-			txnResp = &v3.TxnResponse{
+			txnResp := &v3.TxnResponse{
 				Header:    txn.lkv.header,
 				Succeeded: cacheBool,
 			}
@@ -157,7 +158,10 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 		if len(string(opArray[i].RangeBytes())) > 0 {
 			return responseArray, false
 		}
-		if txn.lkv.leases.entries[key] != nil && opArray[i].IsGet() {
+		if opArray[i].IsPut() || opArray[i].IsDelete() {
+			return responseArray, false
+		}
+		if txn.lkv.leases.entries[key] != nil {
 			respOp = &server.ResponseOp{
 				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.entries[key].response)},
 			}
@@ -169,8 +173,7 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 }
 
 func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
-	isPresent, elseOps, cmps := make(map[string]bool), make([]v3.Op, 0), make([]v3.Cmp, 0)
-	var rev int64
+	isPresent, elseOps, cmps, rev := make(map[string]bool), make([]v3.Op, 0), make([]v3.Cmp, 0), int64(0)
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
 		li := txn.lkv.leases.checkInCache(key)
@@ -216,17 +219,15 @@ func (txn *txnLeasing) defOpArray(boolvar bool) []v3.Op {
 }
 
 func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
-	var txnResp *v3.TxnResponse
 	responseArray := make([]*server.ResponseOp, 0)
 	for i := range resp.Responses[0].GetResponseTxn().Responses {
 		responseArray = append(responseArray, resp.Responses[0].GetResponseTxn().Responses[i])
 	}
-	txnResp = &v3.TxnResponse{
+	return &v3.TxnResponse{
 		Header:    resp.Header,
 		Succeeded: resp.Responses[0].GetResponseTxn().Succeeded,
 		Responses: responseArray,
 	}
-	return txnResp
 }
 
 func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
@@ -240,7 +241,10 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	txn.lkv.leases.mu.Lock()
 	for i := range temp {
 		li := txn.lkv.leases.entries[string(temp[i].KeyBytes())]
-		if li != nil && temp[i].IsPut() {
+		if li == nil {
+			continue
+		}
+		if temp[i].IsPut() {
 			liResp := li.response
 			if liResp.Kvs[0].ModRevision < txnResp.Header.Revision {
 				kvs := []*mvccpb.KeyValue{
@@ -263,7 +267,7 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 			liResp.Kvs[0].Version++
 			li.response = liResp
 		}
-		if li != nil && temp[i].IsDelete() {
+		if temp[i].IsDelete() {
 			delete(txn.lkv.leases.entries, string(temp[i].KeyBytes()))
 		}
 	}
@@ -272,14 +276,10 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 
 func (txn *txnLeasing) gatherOps(resp *server.ResponseOp, myOps []v3.Op) []v3.Op {
 	allOps := make([]v3.Op, 0)
-	if len(myOps) == 0 {
-		return allOps
-	}
 	for i := range myOps {
 		if !myOps[i].IsTxn() {
 			allOps = append(allOps, myOps[i])
-		}
-		if myOps[i].IsTxn() {
+		} else {
 			_, thenOps, elseOps := myOps[i].Txn()
 			if resp.GetResponseTxn().Succeeded {
 				allOps = append(allOps, txn.gatherOps(resp.GetResponseTxn().Responses[i], thenOps)...)
@@ -293,14 +293,10 @@ func (txn *txnLeasing) gatherOps(resp *server.ResponseOp, myOps []v3.Op) []v3.Op
 
 func (txn *txnLeasing) gatherAllOps(myOps []v3.Op) []v3.Op {
 	allOps := make([]v3.Op, 0)
-	if len(myOps) == 0 {
-		return allOps
-	}
 	for i := range myOps {
 		if !myOps[i].IsTxn() {
 			allOps = append(allOps, myOps[i])
-		}
-		if myOps[i].IsTxn() {
+		} else {
 			_, thenOps, elseOps := myOps[i].Txn()
 			ops := append(thenOps, elseOps...)
 			allOps = append(allOps, txn.gatherAllOps(ops)...)
@@ -328,36 +324,26 @@ func (txn *txnLeasing) NonOwnerRevoke(resp *v3.TxnResponse, elseOps []v3.Op, txn
 	return nil
 }
 
-const (
-	acquireChan     int = 1
-	waitReleaseChan int = 2
-)
-
-func (lc *leaseCache) blockKeys(ops []v3.Op, chanModify int) []chan struct{} {
+func (lc *leaseCache) blockKeysWaitChan(ops []v3.Op) []chan struct{} {
 	var wcs [](chan struct{})
 	lc.mu.Lock()
-	switch chanModify {
-	case waitReleaseChan:
-		for _, op := range ops {
-			key := string(op.KeyBytes())
-			li := lc.entries[key]
-			if li != nil && op.IsGet() {
-				wcs = append(wcs, li.waitc)
-			}
+	defer lc.mu.Unlock()
+	for _, op := range ops {
+		if li := lc.entries[string(op.KeyBytes())]; li != nil && op.IsGet() {
+			wcs = append(wcs, li.waitc)
 		}
-	case acquireChan:
-		for _, op := range ops {
-			if op.IsPut() || op.IsDelete() {
-				key := string(op.KeyBytes())
-				li := lc.entries[key]
-				if li != nil {
-					li.waitc = make(chan struct{})
-					wcs = append(wcs, li.waitc)
-				}
-			}
-		}
-
 	}
-	lc.mu.Unlock()
+	return wcs
+}
+
+func (lc *leaseCache) waitChanAcquire(ops []v3.Op) []chan struct{} {
+	var wcs [](chan struct{})
+	for _, op := range ops {
+		if op.IsPut() || op.IsDelete() {
+			if wc, _ := lc.openWaitChannel(string(op.KeyBytes())); wc != nil {
+				wcs = append(wcs, wc)
+			}
+		}
+	}
 	return wcs
 }

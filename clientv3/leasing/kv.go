@@ -16,7 +16,6 @@ package leasing
 
 import (
 	"strings"
-	"sync"
 	"time"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -36,19 +35,6 @@ type leasingKV struct {
 	header   *server.ResponseHeader
 	maxRev   int64
 	sessionc chan struct{}
-}
-
-type leaseCache struct {
-	monitorRevocation map[string]time.Time
-	entries           map[string]*leaseInfo
-	mu                sync.Mutex
-	flag              int
-}
-
-type leaseInfo struct {
-	waitc    chan struct{}
-	response *v3.GetResponse
-	revision int64
 }
 
 // NewleasingKV wraps a KV instance so that all requests are wired through a leasing protocol.
@@ -89,7 +75,7 @@ func (lkv *leasingKV) monitorSession(cl *v3.Client, ttl int) {
 		default:
 			lkv.leases.mu.Lock()
 			lkv.sessionc = make(chan struct{})
-			lkv.leases.clearCache()
+			lkv.leases.entries = make(map[string]*leaseInfo)
 			lkv.leases.mu.Unlock()
 			s, err := startNewSession(cl, ttl)
 			if err != nil {
@@ -167,7 +153,7 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 }
 
 const (
-	acquireLKAgainDur int = 2
+	leasingRevokeBackoff time.Duration = time.Second * time.Duration(2)
 )
 
 func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
@@ -181,13 +167,11 @@ func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.Txn
 					lkv.leases.trackRevokedLK(key)
 					txn := lkv.kv.Txn(nCtx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", rev)).Then(v3.OpDelete(lkv.pfx + key))
 					delResp, err := txn.Commit()
-					if delResp.Succeeded {
-						lkv.leases.deleteKeyInCache(key)
-						return
-					}
 					if err != nil || !delResp.Succeeded {
 						continue
 					}
+					lkv.leases.deleteKeyInCache(key)
+					return
 				}
 			}
 		}
@@ -208,8 +192,7 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 	lr, ok := lkv.leases.monitorRevocation[key]
 	lkv.leases.mu.Unlock()
 	if ok {
-		timeElasped := lr.Minute()*60 + lr.Second()
-		currTime := time.Now().Local().Minute()*60 + (time.Now().Local().Second())
+		timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
 		if timeElasped < currTime {
 			return lkv.acquireLeaseRPC(ctx, key, op)
 		}
@@ -289,11 +272,6 @@ func (lkv *leasingKV) deleteKey(ctx context.Context, key string, op v3.Op) (*v3.
 	return delResp, nil
 }
 
-const (
-	modRev    int = 2
-	createRev int = 1
-)
-
 func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v3.DeleteResponse, error) {
 	for ctx.Err() == nil {
 		endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(lkv.pfx+key)
@@ -321,7 +299,7 @@ func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v
 		if err != nil {
 			return nil, err
 		}
-		maxRev, maxRevLK := maxRevision(getResp, modRev), maxRevision(getRespLK, createRev)
+		maxRev, maxRevLK := maxModRev(getResp), maxCreateRev(getRespLK)
 		txn1 := lkv.kv.Txn(ctx).If(v3.Compare(v3.ModRevision(key).WithRange(endKey), "<", maxRev+1),
 			v3.Compare(v3.CreateRevision(lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
 		delRangeResp, err := txn1.Then(v3.OpDelete(key, v3.WithRange(endKey))).Commit()
@@ -422,7 +400,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 				}
 				return txnResp, nil
 			}
-			for _, ch := range txn.lkv.leases.blockKeys(opArray, waitReleaseChan) {
+			for _, ch := range txn.lkv.leases.blockKeysWaitChan(opArray) {
 				select {
 				case <-ch:
 				case <-txn.ctx.Done():
@@ -444,7 +422,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		<-txn.lkv.sessionc
 		allOps := append(txn.opst, txn.opse...)
 		txnOps := txn.gatherAllOps(allOps)
-		wcs := txn.lkv.leases.blockKeys(txnOps, acquireChan)
+		wcs := txn.lkv.leases.waitChanAcquire(txnOps)
 		for {
 			elseOps, cmps := txn.cmpUpdate(txnOps)
 			resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()

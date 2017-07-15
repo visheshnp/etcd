@@ -1,6 +1,7 @@
 package leasing
 
 import (
+	"sync"
 	"time"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -9,6 +10,19 @@ import (
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"golang.org/x/net/context"
 )
+
+type leaseCache struct {
+	monitorRevocation map[string]time.Time
+	entries           map[string]*leaseInfo
+	mu                sync.Mutex
+	flag              int
+}
+
+type leaseInfo struct {
+	waitc    chan struct{}
+	response *v3.GetResponse
+	revision int64
+}
 
 func (lc *leaseCache) checkInCache(key string) *leaseInfo {
 	lc.mu.Lock()
@@ -21,11 +35,6 @@ func (lc *leaseCache) deleteKeyInCache(key string) {
 	defer lc.mu.Unlock()
 	if li := lc.entries[key]; li != nil {
 		delete(lc.entries, key)
-	}
-}
-func (lc *leaseCache) clearCache() {
-	for k := range lc.entries {
-		delete(lc.entries, k)
 	}
 }
 
@@ -54,18 +63,16 @@ func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.Respon
 		mapResp.Kvs, mapResp.More, mapResp.Count = append(mapResp.Kvs, myKV), false, 1
 		mapResp.Kvs[0].CreateRevision = respHeader.Revision
 	}
-	if len(mapResp.Kvs) > 0 {
-		if mapResp.Kvs[0].ModRevision < respHeader.Revision {
-			mapResp.Header, mapResp.Kvs[0].Value = respHeader, []byte(val)
-			mapResp.Kvs[0].ModRevision = respHeader.Revision
-		}
-		mapResp.Kvs[0].Version++
+	if mapResp.Kvs[0].ModRevision < respHeader.Revision {
+		mapResp.Header, mapResp.Kvs[0].Value = respHeader, []byte(val)
+		mapResp.Kvs[0].ModRevision = respHeader.Revision
 	}
+	mapResp.Kvs[0].Version++
 }
 
 func (lc *leaseCache) trackRevokedLK(key string) {
 	lc.mu.Lock()
-	lc.monitorRevocation[key] = time.Now().Local().Add(time.Second * time.Duration(acquireLKAgainDur))
+	lc.monitorRevocation[key] = time.Now().Add(leasingRevokeBackoff)
 	lc.mu.Unlock()
 }
 
@@ -99,11 +106,10 @@ func (lc *leaseCache) returnCachedResp(ctx context.Context, key string, op v3.Op
 	var keyCopy, valCopy []byte
 	var kvs []*mvccpb.KeyValue
 	var kvsnil bool
-	if len(resp.Kvs) == 0 || op.IsCountOnly() || (op.IsMaxModRev() != 0 && op.IsMaxModRev() <= resp.Kvs[0].ModRevision) ||
-		(op.IsMaxCreateRev() != 0 && op.IsMaxCreateRev() <= resp.Kvs[0].CreateRevision) ||
-		(op.IsMinModRev() != 0 && op.IsMinModRev() >= resp.Kvs[0].ModRevision) ||
-		(op.IsMinCreateRev() != 0 && op.IsMinCreateRev() >= resp.Kvs[0].CreateRevision) {
-		kvs = nil
+	if len(resp.Kvs) == 0 || op.IsCountOnly() || (op.MaxModRev() != 0 && op.MaxModRev() <= resp.Kvs[0].ModRevision) ||
+		(op.MaxCreateRev() != 0 && op.MaxCreateRev() <= resp.Kvs[0].CreateRevision) ||
+		(op.MinModRev() != 0 && op.MinModRev() >= resp.Kvs[0].ModRevision) ||
+		(op.MinCreateRev() != 0 && op.MinCreateRev() >= resp.Kvs[0].CreateRevision) {
 		kvsnil = true
 	}
 	if len(resp.Kvs) > 0 && !kvsnil {
@@ -169,20 +175,21 @@ func (lkv *leasingKV) initializeSession(s *concurrency.Session) {
 	lkv.leases.mu.Unlock()
 }
 
-func maxRevision(getResp *v3.GetResponse, revType int) int64 {
+func maxCreateRev(getResp *v3.GetResponse) int64 {
 	var maxRev int64
-	switch revType {
-	case createRev:
-		for i := range getResp.Kvs {
-			if maxRev < getResp.Kvs[i].CreateRevision {
-				maxRev = getResp.Kvs[i].CreateRevision
-			}
+	for i := range getResp.Kvs {
+		if maxRev < getResp.Kvs[i].CreateRevision {
+			maxRev = getResp.Kvs[i].CreateRevision
 		}
-	case modRev:
-		for i := range getResp.Kvs {
-			if maxRev < getResp.Kvs[i].ModRevision {
-				maxRev = getResp.Kvs[i].ModRevision
-			}
+	}
+	return maxRev
+}
+
+func maxModRev(getResp *v3.GetResponse) int64 {
+	var maxRev int64
+	for i := range getResp.Kvs {
+		if maxRev < getResp.Kvs[i].ModRevision {
+			maxRev = getResp.Kvs[i].ModRevision
 		}
 	}
 	return maxRev
