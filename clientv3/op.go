@@ -110,23 +110,23 @@ func (op Op) IsKeysOnly() bool { return op.keysOnly == true }
 // IsCountOnly returns true if the countonly field is true.
 func (op Op) IsCountOnly() bool { return op.countOnly == true }
 
-// IsMinModRev returns if field is populated.
-func (op Op) IsMinModRev() int64 { return op.minModRev }
+// MinModRev returns if field is populated.
+func (op Op) MinModRev() int64 { return op.minModRev }
 
-// IsMaxModRev returns if field is populated.
-func (op Op) IsMaxModRev() int64 { return op.maxModRev }
+// MaxModRev returns if field is populated.
+func (op Op) MaxModRev() int64 { return op.maxModRev }
 
-// IsMinCreateRev returns if field is populated.
-func (op Op) IsMinCreateRev() int64 { return op.minCreateRev }
+// MinCreateRev returns if field is populated.
+func (op Op) MinCreateRev() int64 { return op.minCreateRev }
 
-// IsMaxCreateRev returns if field is populated.
-func (op Op) IsMaxCreateRev() int64 { return op.maxCreateRev }
+// MaxCreateRev returns if field is populated.
+func (op Op) MaxCreateRev() int64 { return op.maxCreateRev }
 
-// IsLimit returns if field is populated.
-func (op Op) IsLimit() int64 { return op.limit }
+// Limit returns if field is populated.
+func (op Op) retLimit() int64 { return op.limit }
 
-// IsSort returns if field is populated.
-func (op Op) IsSort() bool { return op.sort != nil }
+// Sort returns if field is populated.
+func (op Op) retSort() bool { return op.sort != nil }
 
 // WithRangeBytes sets the byte slice for the Op's range end.
 func (op *Op) WithRangeBytes(end []byte) { op.end = end }
