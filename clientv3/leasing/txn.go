@@ -3,6 +3,7 @@ package leasing
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -336,14 +337,62 @@ func (lc *leaseCache) blockKeysWaitChan(ops []v3.Op) []chan struct{} {
 	return wcs
 }
 
-func (lc *leaseCache) waitChanAcquire(ops []v3.Op) []chan struct{} {
+func (lkv *leasingKV) waitChanAcquire(ctx context.Context, ops []v3.Op) ([]chan struct{}, error) {
 	var wcs [](chan struct{})
 	for _, op := range ops {
-		if op.IsPut() || op.IsDelete() {
-			if wc, _ := lc.openWaitChannel(string(op.KeyBytes())); wc != nil {
-				wcs = append(wcs, wc)
+		if op.IsGet() {
+			continue
+		}
+		key := string(op.KeyBytes())
+		if len(key) > 0 {
+			resp, err := lkv.kv.Get(ctx, key, v3.WithRange(string(op.RangeBytes())))
+			if err != nil {
+				return nil, err
+			}
+			for i := range resp.Kvs {
+				gkey := string(resp.Kvs[i].Key)
+				if _, ok := lkv.leases.entries[gkey]; ok {
+					if wc, _ := lkv.leases.openWaitChannel(gkey); wc != nil {
+						wcs = append(wcs, wc)
+					}
+				}
 			}
 		}
+		if wc, _ := lkv.leases.openWaitChannel(string(op.KeyBytes())); wc != nil {
+			wcs = append(wcs, wc)
+		}
 	}
-	return wcs
+	fmt.Println("wcs", wcs)
+	return wcs, nil
+}
+
+func (txn *txnLeasing) cacheTxn(serverTxnBool bool, cacheBool bool) (*v3.TxnResponse, error) {
+	opArray := txn.gatherAllOps(txn.defOpArray(cacheBool))
+	if ok, txnResp, err := txn.noOps(opArray, cacheBool); ok {
+		if err != nil {
+			return nil, err
+		}
+		return txnResp, nil
+	}
+	for _, ch := range txn.lkv.leases.blockKeysWaitChan(opArray) {
+		select {
+		case <-ch:
+		case <-txn.ctx.Done():
+			return nil, txn.ctx.Err()
+		}
+	}
+	txn.lkv.leases.mu.Lock()
+	responseArray, ok := txn.cacheOpArray(opArray)
+	txn.lkv.leases.mu.Unlock()
+	if ok {
+		if !txn.lkv.checkOpenSession() {
+			return txn.lkv.cl.Txn(txn.ctx).If(txn.cs...).Then(txn.opst...).Else(txn.opse...).Commit()
+		}
+		if txn.lkv.checkCtxCancel(txn.ctx) {
+			return nil, txn.ctx.Err()
+		}
+		cacheResp, _ := txn.lkv.allInCache(responseArray, cacheBool)
+		return cacheResp, nil
+	}
+	return nil, nil
 }

@@ -72,7 +72,7 @@ func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.Respon
 
 func (lc *leaseCache) trackRevokedLK(key string) {
 	lc.mu.Lock()
-	lc.monitorRevocation[key] = time.Now().Add(leasingRevokeBackoff)
+	lc.monitorRevocation[key] = time.Now()
 	lc.mu.Unlock()
 }
 
@@ -140,7 +140,7 @@ func (lc *leaseCache) returnCachedResp(ctx context.Context, key string, op v3.Op
 	return copyResp
 }
 
-func (lkv *leasingKV) checkOpenSessionChannel() bool {
+func (lkv *leasingKV) checkOpenSession() bool {
 	lkv.leases.mu.Lock()
 	defer lkv.leases.mu.Unlock()
 	select {
