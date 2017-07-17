@@ -10,6 +10,15 @@ import (
 	"github.com/coreos/etcd/mvcc/mvccpb"
 )
 
+type txnLeasing struct {
+	v3.Txn
+	lkv  *leasingKV
+	ctx  context.Context
+	cs   []v3.Cmp
+	opst []v3.Op
+	opse []v3.Op
+}
+
 func compareInt64(a, b int64) int {
 	switch {
 	case a < b:
@@ -186,29 +195,16 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp, error) {
 			continue
 		}
 		if len(op.RangeBytes()) > 0 {
-			endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(txn.lkv.pfx+key)
-			resp, err := txn.lkv.kv.Get(txn.ctx, string(op.KeyBytes()), v3.WithRange(string(op.RangeBytes())))
+			_, maxRevLK, err := txn.lkv.maxRevLK(txn.ctx, string(op.KeyBytes()), op)
 			if err != nil {
 				return nil, nil, err
 			}
-			getRespLK, err := txn.lkv.kv.Get(txn.ctx, txn.lkv.pfx+string(op.KeyBytes()), v3.WithRange(leasingendKey))
+			getResp, err := txn.lkv.kv.Get(txn.ctx, key, v3.WithRange(string(op.RangeBytes())))
 			if err != nil {
 				return nil, nil, err
 			}
-			for i := range resp.Kvs {
-				gkey := string(resp.Kvs[i].Key)
-				if _, ok := txn.lkv.leases.entries[gkey]; !ok {
-					if err := txn.lkv.revokeLease(txn.ctx, gkey); err != nil {
-						return nil, nil, err
-					}
-				}
-			}
-			getResp, err := txn.lkv.kv.Get(txn.ctx, string(op.KeyBytes()), v3.WithRange(endKey))
-			if err != nil {
-				return nil, nil, err
-			}
-			maxRev, maxRevLK := maxModRev(getResp), maxCreateRev(getRespLK)
-			cmps = append(cmps, v3.Compare(v3.ModRevision(key).WithRange(endKey), "<", maxRev+1))
+			maxRev, leasingendKey := maxModRev(getResp), v3.GetPrefixRangeEnd(txn.lkv.pfx+key)
+			cmps = append(cmps, v3.Compare(v3.ModRevision(key).WithRange(string(op.RangeBytes())), "<", maxRev+1))
 			cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
 		}
 		if !isPresent[txn.lkv.pfx+key] {
@@ -422,4 +418,32 @@ func (txn *txnLeasing) cacheTxn(serverTxnBool bool, cacheBool bool) (*v3.TxnResp
 		return cacheResp, nil
 	}
 	return nil, nil
+}
+
+func (txn *txnLeasing) serverTxn(txnOps []v3.Op, wcs []chan struct{}) (*v3.TxnResponse, error) {
+	var txnResp *v3.TxnResponse
+	for {
+		elseOps, cmps, err := txn.cmpUpdate(txnOps)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
+		if err != nil {
+			for i := range cmps {
+				txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(string(cmps[i].Key), txn.lkv.pfx))
+			}
+			return nil, err
+		}
+		if resp.Succeeded {
+			txnResp = txn.extractResp(resp)
+			txn.modifyCacheTxn(txnResp)
+			closeWaitChannel(wcs)
+			break
+		}
+		err = txn.NonOwnerRevoke(resp, elseOps, txnOps)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return txnResp, nil
 }

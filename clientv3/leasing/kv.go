@@ -15,7 +15,6 @@
 package leasing
 
 import (
-	"strings"
 	"time"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -305,35 +304,48 @@ func (lkv *leasingKV) deleteRangeRPC(ctx context.Context, maxRevLK int64, key st
 	return delResp, nil
 }
 
+func (lkv *leasingKV) maxRevLK(ctx context.Context, key string, op v3.Op) (*v3.GetResponse, int64, error) {
+	endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(lkv.pfx+key)
+	resp, err := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
+	if err != nil {
+		return nil, 0, err
+	}
+	getRespLK, err := lkv.kv.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
+	if err != nil {
+		return nil, 0, err
+	}
+	maxRevLK := maxCreateRev(getRespLK)
+	for i := range resp.Kvs {
+		gkey := string(resp.Kvs[i].Key)
+		if _, ok := lkv.leases.entries[gkey]; !ok {
+			if err := lkv.revokeLease(ctx, gkey); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	return resp, maxRevLK, nil
+}
+
 func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v3.DeleteResponse, error) {
 	for ctx.Err() == nil {
-		endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(lkv.pfx+key)
 		var wc [](chan struct{})
-		resp, err := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
-		if err != nil {
-			return nil, err
-		}
-		getRespLK, err := lkv.kv.Get(ctx, lkv.pfx+key, v3.WithRange(leasingendKey))
+		resp, maxRevLK, err := lkv.maxRevLK(ctx, key, op)
 		if err != nil {
 			return nil, err
 		}
 		for i := range resp.Kvs {
 			gkey := string(resp.Kvs[i].Key)
-			if _, ok := lkv.leases.entries[gkey]; !ok {
-				if err := lkv.revokeLease(ctx, gkey); err != nil {
-					return nil, err
-				}
-			} else {
+			if _, ok := lkv.leases.entries[gkey]; ok {
 				wcKey, _ := lkv.leases.openWaitChannel(gkey)
 				wc = append(wc, wcKey)
 			}
 		}
-		getResp, err := lkv.kv.Get(ctx, key, v3.WithRange(endKey))
+		getResp, err := lkv.kv.Get(ctx, key, v3.WithRange(string(op.RangeBytes())))
 		if err != nil {
 			return nil, err
 		}
-		maxRevLK := maxCreateRev(getRespLK)
-		delResp, err := lkv.deleteRangeRPC(ctx, maxRevLK, key, endKey, wc, getResp)
+
+		delResp, err := lkv.deleteRangeRPC(ctx, maxRevLK, key, string(op.RangeBytes()), wc, getResp)
 		if delResp != nil || err != nil {
 			return delResp, err
 		}
@@ -377,15 +389,6 @@ func (lkv *leasingKV) Delete(ctx context.Context, key string, opts ...v3.OpOptio
 	return r.Del(), nil
 }
 
-type txnLeasing struct {
-	v3.Txn
-	lkv  *leasingKV
-	ctx  context.Context
-	cs   []v3.Cmp
-	opst []v3.Op
-	opse []v3.Op
-}
-
 func (lkv *leasingKV) Txn(ctx context.Context) v3.Txn {
 	return &txnLeasing{lkv.kv.Txn(ctx), lkv, ctx, make([]v3.Cmp, 0), make([]v3.Op, 0), make([]v3.Op, 0)}
 }
@@ -412,7 +415,6 @@ func (txn *txnLeasing) Else(ops ...v3.Op) v3.Txn {
 }
 
 func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
-	var txnResp *v3.TxnResponse
 	cacheBool, serverTxnBool := txn.allCmpsfromCache()
 	if !serverTxnBool {
 		resp, err := txn.cacheTxn(serverTxnBool, cacheBool)
@@ -429,30 +431,7 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	for {
-		elseOps, cmps, err := txn.cmpUpdate(txnOps)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
-		if err != nil {
-			for i := range cmps {
-				txn.lkv.leases.deleteKeyInCache(strings.TrimPrefix(string(cmps[i].Key), txn.lkv.pfx))
-			}
-			return nil, err
-		}
-		if resp.Succeeded {
-			txnResp = txn.extractResp(resp)
-			txn.modifyCacheTxn(txnResp)
-			closeWaitChannel(wcs)
-			break
-		}
-		err = txn.NonOwnerRevoke(resp, elseOps, txnOps)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return txnResp, nil
+	return txn.serverTxn(txnOps, wcs)
 }
 
 func (lkv *leasingKV) Compact(ctx context.Context, rev int64, opts ...v3.CompactOption) (*v3.CompactResponse, error) {
