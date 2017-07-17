@@ -76,7 +76,7 @@ const (
 
 func (lc *leaseCache) trackRevokedLK(key string) {
 	lc.mu.Lock()
-	lc.monitorRevocation[key] = time.Now().Add(leasingRevokeBackoff)
+	lc.monitorRevocation[key] = time.Now()
 	lc.mu.Unlock()
 }
 
@@ -222,5 +222,22 @@ func respHeaderPopulate(respHeader *server.ResponseHeader) *server.ResponseHeade
 func closeWaitChannel(wc []chan struct{}) {
 	for i := range wc {
 		close(wc[i])
+	}
+}
+
+func (lc *leaseCache) clearRevocationMap(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+			lc.mu.Lock()
+			for k, lr := range lc.monitorRevocation {
+				if time.Now().Sub(lr.Add(leasingRevokeBackoff)) > 0 {
+					delete(lc.monitorRevocation, k)
+				}
+			}
+			lc.mu.Unlock()
+		}
 	}
 }

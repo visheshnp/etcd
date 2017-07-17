@@ -48,6 +48,7 @@ func NewleasingKV(cl *v3.Client, leasingprefix string) (v3.KV, error) {
 	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{monitorRevocation: make(map[string]time.Time),
 		entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
 	go kv.monitorSession(cl, 0)
+	go kv.leases.clearRevocationMap(cctx)
 	return &kv, nil
 }
 
@@ -62,6 +63,8 @@ func NewleasingKVTTL(cl *v3.Client, leasingprefix string, ttl int) (v3.KV, error
 	cctx, cancel := context.WithCancel(cl.Ctx())
 	kv := leasingKV{cl: cl, kv: cl.KV, pfx: leasingprefix, session: s, leases: leaseCache{monitorRevocation: make(map[string]time.Time),
 		entries: make(map[string]*leaseInfo)}, ctx: cctx, cancel: cancel, maxRev: 1, sessionc: sessionc}
+	go kv.monitorSession(cl, 0)
+	go kv.leases.clearRevocationMap(cctx)
 	return &kv, nil
 }
 
@@ -189,17 +192,9 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 	lkv.leases.mu.Lock()
 	lr, ok := lkv.leases.monitorRevocation[key]
 	lkv.leases.mu.Unlock()
-	if !ok {
+	if !ok || time.Since(lr) > leasingRevokeBackoff {
 		return lkv.acquireLeaseRPC(ctx, key, op)
 	}
-	timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
-	if timeElasped < currTime {
-		return lkv.acquireLeaseRPC(ctx, key, op)
-	}
-	//	select {
-	//case <-time.After(leasingRevokeBackoff):
-	//	return lkv.acquireLeaseRPC(ctx, key, op)
-	//	default:
 	if resp, err := lkv.kv.Txn(ctx).Then(op).Commit(); resp != nil {
 		txnResp := &v3.TxnResponse{
 			Header:    respHeaderPopulate(resp.Header),
@@ -209,7 +204,6 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 		return txnResp, err
 	}
 	return nil, nil
-	//}
 }
 
 func (lkv *leasingKV) get(ctx context.Context, key string, op v3.Op) (*v3.GetResponse, error) {
