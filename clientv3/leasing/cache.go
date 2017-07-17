@@ -70,9 +70,13 @@ func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.Respon
 	mapResp.Kvs[0].Version++
 }
 
+const (
+	leasingRevokeBackoff time.Duration = time.Second * time.Duration(2)
+)
+
 func (lc *leaseCache) trackRevokedLK(key string) {
 	lc.mu.Lock()
-	lc.monitorRevocation[key] = time.Now()
+	lc.monitorRevocation[key] = time.Now().Add(leasingRevokeBackoff)
 	lc.mu.Unlock()
 }
 
@@ -104,7 +108,6 @@ func (lc *leaseCache) returnCachedResp(ctx context.Context, key string, op v3.Op
 	}
 	lc.mu.Lock()
 	var keyCopy, valCopy []byte
-	var kvs []*mvccpb.KeyValue
 	var kvsnil bool
 	if len(resp.Kvs) == 0 || op.IsCountOnly() || (op.MaxModRev() != 0 && op.MaxModRev() <= resp.Kvs[0].ModRevision) ||
 		(op.MaxCreateRev() != 0 && op.MaxCreateRev() <= resp.Kvs[0].CreateRevision) ||
@@ -112,6 +115,7 @@ func (lc *leaseCache) returnCachedResp(ctx context.Context, key string, op v3.Op
 		(op.MinCreateRev() != 0 && op.MinCreateRev() >= resp.Kvs[0].CreateRevision) {
 		kvsnil = true
 	}
+	var kvs []*mvccpb.KeyValue
 	if len(resp.Kvs) > 0 && !kvsnil {
 		keyCopy = make([]byte, len(resp.Kvs[0].Key))
 		copy(keyCopy, resp.Kvs[0].Key)

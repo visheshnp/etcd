@@ -161,24 +161,18 @@ func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResp
 }
 
 func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool) {
-	respOp, responseArray, opCount := &server.ResponseOp{}, make([]*server.ResponseOp, len(opArray)), 0
+	respOp, responseArray := &server.ResponseOp{}, make([]*server.ResponseOp, len(opArray))
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
-		if len(string(opArray[i].RangeBytes())) > 0 {
+		if len(string(opArray[i].RangeBytes())) > 0 || txn.lkv.leases.entries[key] == nil || opArray[i].IsPut() || opArray[i].IsDelete() {
 			return responseArray, false
 		}
-		if opArray[i].IsPut() || opArray[i].IsDelete() {
-			return responseArray, false
+		respOp = &server.ResponseOp{
+			Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.entries[key].response)},
 		}
-		if txn.lkv.leases.entries[key] != nil {
-			respOp = &server.ResponseOp{
-				Response: &server.ResponseOp_ResponseRange{(*server.RangeResponse)(txn.lkv.leases.entries[key].response)},
-			}
-			responseArray[i] = respOp
-			opCount++
-		}
+		responseArray[i] = respOp
 	}
-	return responseArray, opCount == len(opArray)
+	return responseArray, true
 }
 
 func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp, error) {
@@ -194,22 +188,23 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp, error) {
 		if opArray[i].IsGet() {
 			continue
 		}
-		if len(op.RangeBytes()) > 0 {
-			_, maxRevLK, err := txn.lkv.maxRevLK(txn.ctx, string(op.KeyBytes()), op)
-			if err != nil {
-				return nil, nil, err
-			}
-			getResp, err := txn.lkv.kv.Get(txn.ctx, key, v3.WithRange(string(op.RangeBytes())))
-			if err != nil {
-				return nil, nil, err
-			}
-			maxRev, leasingendKey := maxModRev(getResp), v3.GetPrefixRangeEnd(txn.lkv.pfx+key)
-			cmps = append(cmps, v3.Compare(v3.ModRevision(key).WithRange(string(op.RangeBytes())), "<", maxRev+1))
-			cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
-		}
 		if !isPresent[txn.lkv.pfx+key] {
-			cmps, elseOps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)), append(elseOps, v3.OpGet(txn.lkv.pfx+key))
-			isPresent[txn.lkv.pfx+key] = true
+			if len(op.RangeBytes()) == 0 {
+				cmps, elseOps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)), append(elseOps, v3.OpGet(txn.lkv.pfx+key))
+				isPresent[txn.lkv.pfx+key] = true
+			} else {
+				_, maxRevLK, err := txn.lkv.maxRevLK(txn.ctx, string(op.KeyBytes()), op)
+				if err != nil {
+					return nil, nil, err
+				}
+				getResp, err := txn.lkv.kv.Get(txn.ctx, key, v3.WithRange(string(op.RangeBytes())))
+				if err != nil {
+					return nil, nil, err
+				}
+				maxRev, leasingendKey := maxModRev(getResp), v3.GetPrefixRangeEnd(txn.lkv.pfx+key)
+				cmps = append(cmps, v3.Compare(v3.ModRevision(key).WithRange(string(op.RangeBytes())), "<", maxRev+1))
+				cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
+			}
 		}
 	}
 	return elseOps, cmps, nil

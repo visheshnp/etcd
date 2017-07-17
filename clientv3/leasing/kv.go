@@ -154,10 +154,6 @@ func (lkv *leasingKV) Put(ctx context.Context, key, val string, opts ...v3.OpOpt
 	return r.Put(), nil
 }
 
-const (
-	leasingRevokeBackoff time.Duration = time.Second * time.Duration(2)
-)
-
 func (lkv *leasingKV) monitorLease(ctx context.Context, key string, resp *v3.TxnResponse, rev int64) {
 	nCtx, cancel := context.WithCancel(lkv.ctx)
 	defer cancel()
@@ -193,27 +189,27 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 	lkv.leases.mu.Lock()
 	lr, ok := lkv.leases.monitorRevocation[key]
 	lkv.leases.mu.Unlock()
-	if ok {
-		timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
-		if timeElasped < currTime {
-			return lkv.acquireLeaseRPC(ctx, key, op)
-		}
-		//	select {
-		//case <-time.After(leasingRevokeBackoff):
-		//	return lkv.acquireLeaseRPC(ctx, key, op)
-		//	default:
-		if resp, err := lkv.kv.Txn(ctx).Then(op).Commit(); resp != nil {
-			txnResp := &v3.TxnResponse{
-				Header:    respHeaderPopulate(resp.Header),
-				Succeeded: false,
-				Responses: []*server.ResponseOp{(resp.Responses[0])},
-			}
-			return txnResp, err
-		}
-		return nil, nil
-		//}
+	if !ok {
+		return lkv.acquireLeaseRPC(ctx, key, op)
 	}
-	return lkv.acquireLeaseRPC(ctx, key, op)
+	timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
+	if timeElasped < currTime {
+		return lkv.acquireLeaseRPC(ctx, key, op)
+	}
+	//	select {
+	//case <-time.After(leasingRevokeBackoff):
+	//	return lkv.acquireLeaseRPC(ctx, key, op)
+	//	default:
+	if resp, err := lkv.kv.Txn(ctx).Then(op).Commit(); resp != nil {
+		txnResp := &v3.TxnResponse{
+			Header:    respHeaderPopulate(resp.Header),
+			Succeeded: false,
+			Responses: []*server.ResponseOp{(resp.Responses[0])},
+		}
+		return txnResp, err
+	}
+	return nil, nil
+	//}
 }
 
 func (lkv *leasingKV) get(ctx context.Context, key string, op v3.Op) (*v3.GetResponse, error) {
@@ -344,7 +340,6 @@ func (lkv *leasingKV) deleteRange(ctx context.Context, key string, op v3.Op) (*v
 		if err != nil {
 			return nil, err
 		}
-
 		delResp, err := lkv.deleteRangeRPC(ctx, maxRevLK, key, string(op.RangeBytes()), wc, getResp)
 		if delResp != nil || err != nil {
 			return delResp, err
