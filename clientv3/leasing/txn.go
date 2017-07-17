@@ -3,7 +3,6 @@ package leasing
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"strings"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -173,9 +172,9 @@ func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool
 	return responseArray, opCount == len(opArray)
 }
 
-func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
+func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp, error) {
 	isPresent, elseOps, cmps, rev := make(map[string]bool), make([]v3.Op, 0), make([]v3.Cmp, 0), int64(0)
-	for i := range opArray {
+	for i, op := range opArray {
 		key := string(opArray[i].KeyBytes())
 		li := txn.lkv.leases.checkInCache(key)
 		if li != nil {
@@ -186,12 +185,38 @@ func (txn *txnLeasing) cmpUpdate(opArray []v3.Op) ([]v3.Op, []v3.Cmp) {
 		if opArray[i].IsGet() {
 			continue
 		}
+		if len(op.RangeBytes()) > 0 {
+			endKey, leasingendKey := string(op.RangeBytes()), v3.GetPrefixRangeEnd(txn.lkv.pfx+key)
+			resp, err := txn.lkv.kv.Get(txn.ctx, string(op.KeyBytes()), v3.WithRange(string(op.RangeBytes())))
+			if err != nil {
+				return nil, nil, err
+			}
+			getRespLK, err := txn.lkv.kv.Get(txn.ctx, txn.lkv.pfx+string(op.KeyBytes()), v3.WithRange(leasingendKey))
+			if err != nil {
+				return nil, nil, err
+			}
+			for i := range resp.Kvs {
+				gkey := string(resp.Kvs[i].Key)
+				if _, ok := txn.lkv.leases.entries[gkey]; !ok {
+					if err := txn.lkv.revokeLease(txn.ctx, gkey); err != nil {
+						return nil, nil, err
+					}
+				}
+			}
+			getResp, err := txn.lkv.kv.Get(txn.ctx, string(op.KeyBytes()), v3.WithRange(endKey))
+			if err != nil {
+				return nil, nil, err
+			}
+			maxRev, maxRevLK := maxModRev(getResp), maxCreateRev(getRespLK)
+			cmps = append(cmps, v3.Compare(v3.ModRevision(key).WithRange(endKey), "<", maxRev+1))
+			cmps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key).WithRange(leasingendKey), "<", maxRevLK+1))
+		}
 		if !isPresent[txn.lkv.pfx+key] {
 			cmps, elseOps = append(cmps, v3.Compare(v3.CreateRevision(txn.lkv.pfx+key), "=", rev)), append(elseOps, v3.OpGet(txn.lkv.pfx+key))
 			isPresent[txn.lkv.pfx+key] = true
 		}
 	}
-	return elseOps, cmps
+	return elseOps, cmps, nil
 }
 
 func (lkv *leasingKV) allInCache(responseArray []*server.ResponseOp, boolvar bool) (*v3.TxnResponse, error) {
@@ -241,6 +266,13 @@ func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
 	}
 	txn.lkv.leases.mu.Lock()
 	for i := range temp {
+		if len(string(temp[i].RangeBytes())) > 0 {
+			for k := range txn.lkv.leases.entries {
+				if strings.HasPrefix(k, string(temp[i].KeyBytes())) {
+					delete(txn.lkv.leases.entries, k)
+				}
+			}
+		}
 		li := txn.lkv.leases.entries[string(temp[i].KeyBytes())]
 		if li == nil {
 			continue
@@ -343,18 +375,14 @@ func (lkv *leasingKV) waitChanAcquire(ctx context.Context, ops []v3.Op) ([]chan 
 		if op.IsGet() {
 			continue
 		}
-		key := string(op.KeyBytes())
-		if len(key) > 0 {
-			resp, err := lkv.kv.Get(ctx, key, v3.WithRange(string(op.RangeBytes())))
+		if len(string(op.RangeBytes())) > 0 {
+			resp, err := lkv.kv.Get(ctx, string(op.KeyBytes()), v3.WithRange(string(op.RangeBytes())))
 			if err != nil {
 				return nil, err
 			}
 			for i := range resp.Kvs {
-				gkey := string(resp.Kvs[i].Key)
-				if _, ok := lkv.leases.entries[gkey]; ok {
-					if wc, _ := lkv.leases.openWaitChannel(gkey); wc != nil {
-						wcs = append(wcs, wc)
-					}
+				if wc, _ := lkv.leases.openWaitChannel(string(resp.Kvs[i].Key)); wc != nil {
+					wcs = append(wcs, wc)
 				}
 			}
 		}
@@ -362,7 +390,6 @@ func (lkv *leasingKV) waitChanAcquire(ctx context.Context, ops []v3.Op) ([]chan 
 			wcs = append(wcs, wc)
 		}
 	}
-	fmt.Println("wcs", wcs)
 	return wcs, nil
 }
 

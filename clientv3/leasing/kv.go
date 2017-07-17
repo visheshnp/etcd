@@ -15,7 +15,6 @@
 package leasing
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -132,6 +131,7 @@ func (lkv *leasingKV) put(ctx context.Context, key, val string, op v3.Op) (*v3.P
 		if respPut != nil || err != nil {
 			return respPut, err
 		}
+
 		txn := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "=", 0)).Then(op)
 		resp, err := txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease())).Commit()
 		if err != nil {
@@ -192,18 +192,18 @@ func (lkv *leasingKV) acquireLeaseRPC(ctx context.Context, key string, op v3.Op)
 
 func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*v3.TxnResponse, error) {
 	lkv.leases.mu.Lock()
-	_, ok := lkv.leases.monitorRevocation[key]
+	lr, ok := lkv.leases.monitorRevocation[key]
 	lkv.leases.mu.Unlock()
 	if ok {
-		//timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
-		//	if timeElasped < currTime {
-		//	return lkv.acquireLeaseRPC(ctx, key, op)
-		//}
-		select {
-		case <-time.After(leasingRevokeBackoff):
+		timeElasped, currTime := lr.Minute()*60+lr.Second(), time.Now().Minute()*60+time.Now().Second()
+		if timeElasped < currTime {
 			return lkv.acquireLeaseRPC(ctx, key, op)
-		default:
-			resp, err := lkv.kv.Txn(ctx).Then(op).Commit()
+		}
+		//	select {
+		//case <-time.After(leasingRevokeBackoff):
+		//	return lkv.acquireLeaseRPC(ctx, key, op)
+		//	default:
+		if resp, err := lkv.kv.Txn(ctx).Then(op).Commit(); resp != nil {
 			txnResp := &v3.TxnResponse{
 				Header:    respHeaderPopulate(resp.Header),
 				Succeeded: false,
@@ -211,6 +211,8 @@ func (lkv *leasingKV) acquireLease(ctx context.Context, key string, op v3.Op) (*
 			}
 			return txnResp, err
 		}
+		return nil, nil
+		//}
 	}
 	return lkv.acquireLeaseRPC(ctx, key, op)
 }
@@ -423,13 +425,15 @@ func (txn *txnLeasing) Commit() (*v3.TxnResponse, error) {
 		return nil, txn.ctx.Err()
 	}
 	txnOps := txn.gatherAllOps(append(txn.opst, txn.opse...))
-	fmt.Println("txnOps", txnOps)
 	wcs, err := txn.lkv.waitChanAcquire(txn.ctx, txnOps)
 	if err != nil {
 		return nil, err
 	}
 	for {
-		elseOps, cmps := txn.cmpUpdate(txnOps)
+		elseOps, cmps, err := txn.cmpUpdate(txnOps)
+		if err != nil {
+			return nil, err
+		}
 		resp, err := txn.lkv.kv.Txn(txn.ctx).If(cmps...).Then(v3.OpTxn(txn.cs, txn.opst, txn.opse)).Else(elseOps...).Commit()
 		if err != nil {
 			for i := range cmps {
