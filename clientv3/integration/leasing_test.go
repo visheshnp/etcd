@@ -1352,6 +1352,60 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 	}
 }
 
+// TestLeasingReconnectRevokeCompaction checks that revocation works if
+// disconnected and the watch is compacted.
+func TestLeasingReconnectOwnerRevokeCompact(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	defer clus.Terminate(t)
+
+	lkv1, err1 := leasing.NewleasingKV(clus.Client(0), "foo/")
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	lkv2, err2 := leasing.NewleasingKV(clus.Client(1), "foo/")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+
+	if _, err := lkv1.Get(context.TODO(), "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	clus.Members[0].Stop(t)
+	clus.WaitLeader(t)
+
+	// put some more revisions for compaction
+	presp, err := clus.Client(1).Put(context.TODO(), "a", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	presp, err = clus.Client(1).Put(context.TODO(), "a", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// compact while lkv1 is disconnected
+	rev := presp.Header.Revision
+	if _, err := clus.Client(1).Compact(context.TODO(), rev); err != nil {
+		t.Fatal(err)
+	}
+
+	clus.Members[0].Restart(t)
+
+	cctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
+	defer cancel()
+	if _, err := lkv2.Put(cctx, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := lkv1.Get(cctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Kvs[0].Value) != "v" {
+		t.Fatalf(`expected "v" value, got %+v`, resp)
+	}
+}
+
 // TestLeasingReconnectOwnerConsistency checks a write error on an owner will
 // not cause inconsistency between the server and the client.
 func TestLeasingReconnectOwnerConsistency(t *testing.T) {
