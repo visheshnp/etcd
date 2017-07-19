@@ -1311,12 +1311,17 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// force leader away from member 0
+	clus.Members[0].Stop(t)
+	clus.WaitLeader(t)
+	clus.Members[0].Restart(t)
+
 	cctx, cancel := context.WithCancel(context.TODO())
 	sdonec, pdonec := make(chan struct{}), make(chan struct{})
 	// make lkv1 connection choppy so txns fail
 	go func() {
 		defer close(sdonec)
-		for cctx.Err() == nil {
+		for i := 0; i < 10 && cctx.Err() == nil; i++ {
 			clus.Members[0].Stop(t)
 			time.Sleep(100 * time.Millisecond)
 			clus.Members[0].Restart(t)
@@ -1327,12 +1332,19 @@ func TestLeasingReconnectOwnerRevoke(t *testing.T) {
 		if _, err := lkv2.Put(cctx, "k", "v"); err != nil {
 			t.Log(err)
 		}
+		resp, err := lkv1.Get(cctx, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(resp.Kvs[0].Value) != "v" {
+			t.Fatalf(`expected "v" value, got %+v`, resp)
+		}
 	}()
 	select {
 	case <-pdonec:
 		cancel()
 		<-sdonec
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		cancel()
 		<-sdonec
 		<-pdonec
