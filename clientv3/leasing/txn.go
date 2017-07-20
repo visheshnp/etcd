@@ -134,7 +134,7 @@ func (lkv *leasingKV) revokeLease(ctx context.Context, key string) error {
 		return err
 	}
 	if !revokeResp.Succeeded {
-		lkv.watchforLKDel(ctx, key, revokeResp.Header.Revision)
+		lkv.waitForLKDel(ctx, key, revokeResp.Header.Revision)
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func (txn *txnLeasing) noOps(opArray []v3.Op, cacheBool bool) (bool, *v3.TxnResp
 	return noOp, nil, nil
 }
 
-func (txn *txnLeasing) cacheOpArray(opArray []v3.Op) ([]*server.ResponseOp, bool) {
+func (txn *txnLeasing) serveOpsFromCache(opArray []v3.Op) ([]*server.ResponseOp, bool) {
 	respOp, responseArray := &server.ResponseOp{}, make([]*server.ResponseOp, len(opArray))
 	for i := range opArray {
 		key := string(opArray[i].KeyBytes())
@@ -247,7 +247,7 @@ func (txn *txnLeasing) extractResp(resp *v3.TxnResponse) *v3.TxnResponse {
 	}
 }
 
-func (txn *txnLeasing) modifyCacheTxn(txnResp *v3.TxnResponse) {
+func (txn *txnLeasing) modifyCacheAfterTxn(txnResp *v3.TxnResponse) {
 	var temp []v3.Op
 	if txnResp.Succeeded && len(txn.opst) != 0 {
 		temp = txn.gatherOps(txnResp.Responses[0], txn.opst)
@@ -400,7 +400,7 @@ func (txn *txnLeasing) cacheTxn(serverTxnBool bool, cacheBool bool) (*v3.TxnResp
 		}
 	}
 	txn.lkv.leases.mu.Lock()
-	responseArray, ok := txn.cacheOpArray(opArray)
+	responseArray, ok := txn.serveOpsFromCache(opArray)
 	txn.lkv.leases.mu.Unlock()
 	if ok {
 		if !txn.lkv.checkOpenSession() {
@@ -431,7 +431,7 @@ func (txn *txnLeasing) serverTxn(txnOps []v3.Op, wcs []chan struct{}) (*v3.TxnRe
 		}
 		if resp.Succeeded {
 			txnResp = txn.extractResp(resp)
-			txn.modifyCacheTxn(txnResp)
+			txn.modifyCacheAfterTxn(txnResp)
 			closeWaitChannel(wcs)
 			break
 		}

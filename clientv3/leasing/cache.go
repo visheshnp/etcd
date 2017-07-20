@@ -50,7 +50,7 @@ func (lc *leaseCache) openWaitChannel(key string) (chan struct{}, int64) {
 	return nil, 0
 }
 
-func (lc *leaseCache) updateCacheResp(key, val string, respHeader *server.ResponseHeader) {
+func (lc *leaseCache) updateResp(key, val string, respHeader *server.ResponseHeader) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	mapResp := lc.entries[key].response
