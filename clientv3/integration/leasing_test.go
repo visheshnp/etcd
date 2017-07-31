@@ -29,7 +29,7 @@ import (
 	"github.com/coreos/etcd/pkg/testutil"
 )
 
-func TestLeasingPutGet1(t *testing.T) {
+func TestLeasingPutGet(t *testing.T) {
 	defer testutil.AfterTest(t)
 
 	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
