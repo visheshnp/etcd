@@ -387,24 +387,24 @@ func (lkv *leasingKV) revokeLeaseKvs(ctx context.Context, kvs []*mvccpb.KeyValue
 	var wg sync.WaitGroup
 	errCh := make(chan error)
 	done := make(chan struct{})
+	_, cancel := context.WithCancel(ctx)
+	wg.Add(1)
 	//var errTxn bool
-	fmt.Println("kvs len", len(kvs))
-	for _, kv := range kvs {
-		fmt.Println("kv", kv)
-		if rev := kv.CreateRevision; rev > maxLeaseRev {
-			maxLeaseRev = rev
-		}
-		if v3.LeaseID(kv.Lease) == lkv.leaseID() {
-			// don't revoke own keys
-			continue
-		}
-		fmt.Println("revoke start")
-		_, cancel := context.WithCancel(ctx)
-		wg.Add(1)
-		key := strings.TrimPrefix(string(kv.Key), lkv.pfx)
-		fmt.Println("key", key)
-		go func() {
-			defer wg.Done()
+	go func() {
+		defer wg.Done()
+		for _, kv := range kvs {
+			if rev := kv.CreateRevision; rev > maxLeaseRev {
+				maxLeaseRev = rev
+			}
+			if v3.LeaseID(kv.Lease) == lkv.leaseID() {
+				// don't revoke own keys
+				continue
+			}
+			fmt.Println("revoke start")
+
+			key := strings.TrimPrefix(string(kv.Key), lkv.pfx)
+			fmt.Println("key", key)
+
 			rev := lkv.leases.Rev(key)
 			txn := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "<", rev+1)).Then(v3.OpGet(key))
 			resp, err := txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease())).Commit()
@@ -414,23 +414,25 @@ func (lkv *leasingKV) revokeLeaseKvs(ctx context.Context, kvs []*mvccpb.KeyValue
 			if err := lkv.waitRescind(ctx, key, resp.Header.Revision); err != nil {
 				errCh <- err
 			}
-		}()
+		}
+	}()
 
-		fmt.Println("before check")
-		go func() {
-			for err := range errCh {
-				fmt.Println("err", err)
-				cancel()
-				done <- struct{}{}
-				//need to return err
-			}
-		}()
+	fmt.Println("before check")
+	go func() {
+		for err := range errCh {
+			fmt.Println("err", err)
+			cancel()
+			done <- struct{}{}
+			//need to return err
+		}
+	}()
 
-		fmt.Println("end loop")
-	}
+	fmt.Println("end loop")
+
 	wg.Wait()
 	close(errCh)
-	<-done
+	fmt.Println("here")
+	//<-done
 
 	return maxLeaseRev, nil
 }
