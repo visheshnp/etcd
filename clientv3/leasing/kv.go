@@ -15,7 +15,9 @@
 package leasing
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	v3 "github.com/coreos/etcd/clientv3"
@@ -382,7 +384,13 @@ func (lkv *leasingKV) revokeRange(ctx context.Context, begin, end string) (int64
 
 func (lkv *leasingKV) revokeLeaseKvs(ctx context.Context, kvs []*mvccpb.KeyValue) (int64, error) {
 	maxLeaseRev := int64(0)
+	var wg sync.WaitGroup
+	errCh := make(chan error)
+	done := make(chan struct{})
+	//var errTxn bool
+	fmt.Println("kvs len", len(kvs))
 	for _, kv := range kvs {
+		fmt.Println("kv", kv)
 		if rev := kv.CreateRevision; rev > maxLeaseRev {
 			maxLeaseRev = rev
 		}
@@ -390,11 +398,40 @@ func (lkv *leasingKV) revokeLeaseKvs(ctx context.Context, kvs []*mvccpb.KeyValue
 			// don't revoke own keys
 			continue
 		}
+		fmt.Println("revoke start")
+		_, cancel := context.WithCancel(ctx)
+		wg.Add(1)
 		key := strings.TrimPrefix(string(kv.Key), lkv.pfx)
-		if _, err := lkv.revoke(ctx, key, v3.OpGet(key)); err != nil {
-			return 0, err
-		}
+		fmt.Println("key", key)
+		go func() {
+			defer wg.Done()
+			rev := lkv.leases.Rev(key)
+			txn := lkv.kv.Txn(ctx).If(v3.Compare(v3.CreateRevision(lkv.pfx+key), "<", rev+1)).Then(v3.OpGet(key))
+			resp, err := txn.Else(v3.OpPut(lkv.pfx+key, "REVOKE", v3.WithIgnoreLease())).Commit()
+			if err != nil {
+				errCh <- err
+			}
+			if err := lkv.waitRescind(ctx, key, resp.Header.Revision); err != nil {
+				errCh <- err
+			}
+		}()
+
+		fmt.Println("before check")
+		go func() {
+			for err := range errCh {
+				fmt.Println("err", err)
+				cancel()
+				done <- struct{}{}
+				//need to return err
+			}
+		}()
+
+		fmt.Println("end loop")
 	}
+	wg.Wait()
+	close(errCh)
+	<-done
+
 	return maxLeaseRev, nil
 }
 
