@@ -3,6 +3,7 @@ package leasing
 import (
 	"context"
 	"strings"
+	"sync"
 
 	v3 "github.com/coreos/etcd/clientv3"
 	v3pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
@@ -165,12 +166,28 @@ func (txn *txnLeasing) commitToCache(txnResp *v3pb.TxnResponse, userTxn v3.Op) {
 }
 
 func (txn *txnLeasing) revokeFallback(fbResps []*v3pb.ResponseOp) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error)
+	exit := make(chan struct{})
+	cctx, cancel := context.WithCancel(txn.ctx)
 	for _, resp := range fbResps {
-		_, err := txn.lkv.revokeLeaseKvs(txn.ctx, resp.GetResponseRange().Kvs)
-		if err != nil {
+		go txn.lkv.revokeLeaseKvs(cctx, &wg, resp.GetResponseRange().Kvs, errCh)
+	}
+	var errs []error
+	go func() {
+		for err := range errCh {
+			exit <- struct{}{}
+		}
+	}()
+	select {
+	case <-exit:
+		if err := <-exit; err != nil {
+			cancel()
 			return err
 		}
 	}
+	wg.Wait()
+	close(errCh)
 	return nil
 }
 
